@@ -2,7 +2,7 @@
 
 [build]
 builder = "dockerfile"
-dockerfilePath = "../../Dockerfile.ingest"
+dockerfilePath = "/Dockerfile.ingest"
 watchPatterns = [
   "cmd/tidepool-ingest/**",
   "internal/**",

@@ -244,12 +244,10 @@ This repo is set up for a Railway template with **two services**:
 2. Add two services and point each to its config file:
    - **tidepool-query** → `services/query/railway.toml`
    - **tidepool-ingest** → `services/ingest/railway.toml`
+   - Set **Root Directory** for both services to `/` (repo root).
 3. Add a Railway Object Storage (S3-compatible bucket).
 4. Add the bucket env vars to both services (see below).
 5. Optional: add a volume at `/data` for query caching.
-
-Note: a root `Dockerfile` exists as a fallback for platforms that require one, but
-the template uses the service-specific Dockerfiles in `services/*`.
 
 ### Railway Environment Variables
 

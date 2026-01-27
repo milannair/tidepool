@@ -2,7 +2,7 @@
 
 [build]
 builder = "dockerfile"
-dockerfilePath = "../../Dockerfile.query"
+dockerfilePath = "/Dockerfile.query"
 watchPatterns = [
   "cmd/tidepool-query/**",
   "internal/**",
