@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -19,6 +20,13 @@ type Config struct {
 	CacheDir           string
 	Namespace          string
 	CompactionInterval time.Duration
+	Port               string
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	MaxBodyBytes       int64
+	MaxTopK            int
+	CORSAllowOrigin    string
 }
 
 // Load reads configuration from environment variables.
@@ -32,6 +40,13 @@ func Load() *Config {
 		CacheDir:           getEnvOrDefault("CACHE_DIR", "/data"),
 		Namespace:          getEnvOrDefault("NAMESPACE", "default"),
 		CompactionInterval: parseDuration(os.Getenv("COMPACTION_INTERVAL"), 5*time.Minute),
+		Port:               getEnvOrDefault("PORT", "8080"),
+		ReadTimeout:        parseDuration(os.Getenv("READ_TIMEOUT"), 30*time.Second),
+		WriteTimeout:       parseDuration(os.Getenv("WRITE_TIMEOUT"), 60*time.Second),
+		IdleTimeout:        parseDuration(os.Getenv("IDLE_TIMEOUT"), 60*time.Second),
+		MaxBodyBytes:       parseInt64(os.Getenv("MAX_BODY_BYTES"), 25*1024*1024),
+		MaxTopK:            parseInt(os.Getenv("MAX_TOP_K"), 1000),
+		CORSAllowOrigin:    getEnvOrDefault("CORS_ALLOW_ORIGIN", "*"),
 	}
 	return cfg
 }
@@ -81,4 +96,26 @@ func parseDuration(s string, defaultValue time.Duration) time.Duration {
 		return defaultValue
 	}
 	return d
+}
+
+func parseInt64(s string, defaultValue int64) int64 {
+	if s == "" {
+		return defaultValue
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return v
+}
+
+func parseInt(s string, defaultValue int) int {
+	if s == "" {
+		return defaultValue
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultValue
+	}
+	return v
 }

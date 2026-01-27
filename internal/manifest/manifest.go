@@ -12,27 +12,28 @@ import (
 
 // Manifest represents the current state of a namespace's data.
 type Manifest struct {
-	Version   string    `json:"version"`
-	CreatedAt time.Time `json:"created_at"`
-	Segments  []Segment `json:"segments"`
+	Version    string    `json:"version"`
+	CreatedAt  time.Time `json:"created_at"`
+	Segments   []Segment `json:"segments"`
+	Dimensions int       `json:"dimensions,omitempty"`
 }
 
 // Segment represents a data segment in the manifest.
 type Segment struct {
 	ID         string `json:"id"`
 	SegmentKey string `json:"segment_key"`
-	IndexKey   string `json:"index_key"`
 	DocCount   int64  `json:"doc_count"`
+	Dimensions int    `json:"dimensions,omitempty"`
 }
 
 // Manager handles manifest operations.
 type Manager struct {
-	storage   *storage.Client
+	storage   storage.Store
 	namespace string
 }
 
 // NewManager creates a new manifest manager.
-func NewManager(storage *storage.Client, namespace string) *Manager {
+func NewManager(storage storage.Store, namespace string) *Manager {
 	return &Manager{
 		storage:   storage,
 		namespace: namespace,
@@ -91,10 +92,15 @@ func (m *Manager) Save(ctx context.Context, manifest *Manifest) error {
 
 // NewManifest creates a new manifest with the given segments.
 func NewManifest(segments []Segment) *Manifest {
+	var dims int
+	if len(segments) > 0 {
+		dims = segments[0].Dimensions
+	}
 	return &Manifest{
-		Version:   fmt.Sprintf("%d", time.Now().UnixNano()),
-		CreatedAt: time.Now().UTC(),
-		Segments:  segments,
+		Version:    fmt.Sprintf("%d", time.Now().UnixNano()),
+		CreatedAt:  time.Now().UTC(),
+		Segments:   segments,
+		Dimensions: dims,
 	}
 }
 

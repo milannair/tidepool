@@ -1,13 +1,15 @@
 # Tidepool
 
-A stateless search engine backed by object storage.
+A lightweight vector database backed by object storage. Inspired by [Turbopuffer](https://turbopuffer.com/).
+
+Deploy on Railway with Railway Buckets as the storage backend.
 
 ## Architecture
 
-Tidepool consists of two services:
+Tidepool consists of two stateless services:
 
-- **tidepool-query**: HTTP API for search operations
-- **tidepool-ingest**: Background worker for document ingestion and compaction
+- **tidepool-query**: HTTP API for vector similarity search
+- **tidepool-ingest**: Background worker for vector upserts and compaction
 
 ### Design Principles
 
@@ -16,39 +18,38 @@ Tidepool consists of two services:
 - Query service never writes to object storage
 - Ingest service is the only writer
 - Local disk is disposable cache
-- No shared memory or coordination between services
+- No coordination between services
 
-## Storage Model
+## Storage Layout
 
 ```
 namespaces/{namespace}/
   manifests/
-    latest.json          # Current state pointer
+    latest.json          # Current state
     {version}.json       # Versioned snapshots
   wal/
-    {date}/{uuid}.jsonl  # Write-ahead log files
+    {date}/{uuid}.jsonl  # Write-ahead log
   segments/
-    {segment_id}.parquet # Document data
-  indexes/
-    {segment_id}.idx     # Search indexes
+    {segment_id}.tpvs    # Vector segments
 ```
 
 ## API Reference
 
-### Query Service (tidepool-query)
+### Query Service (port 8080)
 
-**POST /search**
+**POST /v1/vectors/{namespace}** or **POST /v1/namespaces/{namespace}/query**
 
-Search for documents.
+Query vectors by similarity.
 
 ```json
 {
-  "query": "search terms",
+  "vector": [0.1, 0.2, 0.3, ...],
+  "top_k": 10,
+  "distance_metric": "cosine_distance",
+  "include_vectors": false,
   "filters": {
-    "tags": ["tag1", "tag2"]
-  },
-  "limit": 10,
-  "offset": 0
+    "category": "article"
+  }
 }
 ```
 
@@ -58,46 +59,46 @@ Response:
 {
   "results": [
     {
-      "document": {
-        "id": "...",
-        "content": "...",
-        "title": "...",
-        "tags": ["..."]
-      },
-      "score": 0.95
+      "id": "doc-123",
+      "attributes": {"category": "article", "title": "..."},
+      "dist": 0.123
     }
   ],
-  "total_hits": 100,
-  "took_ms": 15,
-  "query": "search terms"
+  "namespace": "default"
+}
+```
+
+**GET /v1/namespaces/{namespace}**
+
+Get namespace info.
+
+```json
+{
+  "namespace": "default",
+  "approx_count": 10000,
+  "dimensions": 1536
 }
 ```
 
 **GET /health**
 
-Health check endpoint.
+Health check.
 
-**GET /stats**
+### Ingest Service (port 8080)
 
-Returns search engine statistics.
+**POST /v1/vectors/{namespace}** or **POST /v1/namespaces/{namespace}**
 
-### Ingest Service (tidepool-ingest)
-
-**POST /ingest**
-
-Ingest documents.
+Upsert vectors.
 
 ```json
 {
-  "documents": [
+  "vectors": [
     {
-      "id": "optional-id",
-      "content": "Document content to index",
-      "title": "Document Title",
-      "url": "https://example.com",
-      "tags": ["tag1", "tag2"],
-      "metadata": {
-        "custom": "data"
+      "id": "doc-123",
+      "vector": [0.1, 0.2, 0.3, ...],
+      "attributes": {
+        "category": "article",
+        "title": "My Document"
       }
     }
   ]
@@ -108,8 +109,17 @@ Response:
 
 ```json
 {
-  "ingested": 1,
-  "wal_file": "namespaces/default/wal/2024-01-15/abc123.jsonl"
+  "status": "OK"
+}
+```
+
+**DELETE /v1/vectors/{namespace}** or **DELETE /v1/namespaces/{namespace}**
+
+Delete vectors by ID.
+
+```json
+{
+  "ids": ["doc-123", "doc-456"]
 }
 ```
 
@@ -119,15 +129,19 @@ Trigger manual compaction.
 
 **GET /status**
 
-Returns ingest/compaction status.
+Get ingest/compaction status.
 
 **GET /health**
 
-Health check endpoint.
+Health check.
+
+## Distance Metrics
+
+- `cosine_distance` (default) - 1 - cosine similarity, range [0, 2]
+- `euclidean_squared` - squared L2 distance
+- `dot_product` - negative dot product (for ranking)
 
 ## Configuration
-
-All configuration is via environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -139,14 +153,21 @@ All configuration is via environment variables:
 | `CACHE_DIR` | No | `/data` | Local cache directory |
 | `NAMESPACE` | No | `default` | Data namespace |
 | `COMPACTION_INTERVAL` | No | `5m` | Compaction interval |
+| `PORT` | No | `8080` | HTTP port |
+| `READ_TIMEOUT` | No | `30s` | HTTP read timeout |
+| `WRITE_TIMEOUT` | No | `60s` | HTTP write timeout |
+| `IDLE_TIMEOUT` | No | `60s` | HTTP idle timeout |
+| `MAX_BODY_BYTES` | No | `26214400` | Max request body size in bytes |
+| `MAX_TOP_K` | No | `1000` | Max top_k for queries |
+| `CORS_ALLOW_ORIGIN` | No | `*` | CORS allow origin |
 
 ## Development
 
 ### Prerequisites
 
 - Go 1.23+
-- Docker
-- S3-compatible object storage (MinIO for local development)
+- Docker (optional)
+- S3-compatible storage (MinIO for local dev)
 
 ### Local Development
 
@@ -159,14 +180,13 @@ docker run -p 9000:9000 -p 9001:9001 \
   minio/minio server /data --console-address ":9001"
 ```
 
-2. Create a bucket:
+2. Create bucket:
 
 ```bash
-# Using MinIO client or AWS CLI
 aws --endpoint-url http://localhost:9000 s3 mb s3://tidepool
 ```
 
-3. Set environment variables:
+3. Set environment:
 
 ```bash
 export AWS_ACCESS_KEY_ID=minioadmin
@@ -179,59 +199,83 @@ export BUCKET_NAME=tidepool
 4. Run services:
 
 ```bash
-# Terminal 1 - Query service
+# Terminal 1 - Query
 go run ./cmd/tidepool-query
 
-# Terminal 2 - Ingest service
+# Terminal 2 - Ingest
 go run ./cmd/tidepool-ingest
 ```
 
-### Building Docker Images
+### Example Usage
 
 ```bash
-# Build query service
-docker build -f Dockerfile.query -t tidepool-query .
+# Upsert vectors (to ingest service)
+curl -X POST http://localhost:8081/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [
+      {"id": "1", "vector": [0.1, 0.2, 0.3], "attributes": {"title": "Doc 1"}},
+      {"id": "2", "vector": [0.4, 0.5, 0.6], "attributes": {"title": "Doc 2"}}
+    ]
+  }'
 
-# Build ingest service
-docker build -f Dockerfile.ingest -t tidepool-ingest .
+# Trigger compaction
+curl -X POST http://localhost:8081/compact
+
+# Query vectors (to query service)
+curl -X POST http://localhost:8080/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [0.1, 0.2, 0.3],
+    "top_k": 10
+  }'
 ```
 
-### Running with Docker Compose
+## Railway Template (Two Services)
 
-```bash
-docker-compose up
-```
+This repo is set up for a Railway template with **two services**:
 
-## Deployment
+- **tidepool-query** (read-only API)
+- **tidepool-ingest** (writer + compactor)
 
-### Railway
+### Template Setup
 
-1. Fork this repository
-2. Create a new Railway project
-3. Add two services from the repository:
-   - Service 1: Use `Dockerfile.query`
-   - Service 2: Use `Dockerfile.ingest`
-4. Add a Railway Object Storage bucket
-5. Configure environment variables for both services
-6. Add a volume mount to `/data` for the query service
+1. Create a new Railway project from this repo.
+2. Add two services and point each to its config file:
+   - **tidepool-query** → `services/query/railway.toml`
+   - **tidepool-ingest** → `services/ingest/railway.toml`
+3. Add a Railway Object Storage (S3-compatible bucket).
+4. Add the bucket env vars to both services (see below).
+5. Optional: add a volume at `/data` for query caching.
 
-### Environment Variables on Railway
+Note: a root `Dockerfile` exists as a fallback for platforms that require one, but
+the template uses the service-specific Dockerfiles in `services/*`.
 
-Set these for both services via Railway's variable management:
+### Railway Environment Variables
 
-- `AWS_ACCESS_KEY_ID`: From Railway Object Storage
-- `AWS_SECRET_ACCESS_KEY`: From Railway Object Storage
-- `AWS_ENDPOINT_URL`: From Railway Object Storage
-- `AWS_REGION`: From Railway Object Storage
-- `BUCKET_NAME`: Your bucket name
+Set these for both services:
+- `AWS_ACCESS_KEY_ID` - from Railway bucket
+- `AWS_SECRET_ACCESS_KEY` - from Railway bucket  
+- `AWS_ENDPOINT_URL` - from Railway bucket
+- `AWS_REGION` - from Railway bucket
+- `BUCKET_NAME` - your bucket name
 
-## Data Flow
+Recommended for ingest:
+- `COMPACTION_INTERVAL` - e.g. `5m`
 
-1. **Ingestion**: Documents are POSTed to the ingest service
-2. **WAL Write**: Documents are appended to WAL files in S3
-3. **Compaction**: Periodically, WAL files are compacted into segments
-4. **Manifest Update**: New manifest version is written
-5. **Query**: Query service loads manifest, downloads segments, executes search
+## How It Works
+
+1. **Upsert**: Vectors are written to WAL files in S3
+2. **Compaction**: Background worker merges WAL into segments
+3. **Query**: Loads segments, performs brute-force similarity search
+4. **Delete**: Tombstones written to WAL, applied during compaction
+
+## Limitations (v0)
+
+- Brute-force search (no ANN index yet)
+- Single namespace per deployment
+- Full compaction (rebuilds entire dataset)
+- No streaming/pagination for large result sets
 
 ## License
 

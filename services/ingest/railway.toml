@@ -3,6 +3,13 @@
 [build]
 builder = "dockerfile"
 dockerfilePath = "../../Dockerfile.ingest"
+watchPatterns = [
+  "cmd/tidepool-ingest/**",
+  "internal/**",
+  "go.mod",
+  "go.sum",
+  "Dockerfile.ingest"
+]
 
 [deploy]
 restartPolicyType = "on_failure"

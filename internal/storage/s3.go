@@ -4,6 +4,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 
 	tidepoolconfig "github.com/tidepool/tidepool/internal/config"
 )
@@ -20,6 +22,15 @@ import (
 type Client struct {
 	s3     *s3.Client
 	bucket string
+}
+
+// Store defines the storage interface used across Tidepool.
+type Store interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	Put(ctx context.Context, key string, data []byte) error
+	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, prefix string) ([]string, error)
+	Exists(ctx context.Context, key string) (bool, error)
 }
 
 // NewClient creates a new S3 storage client.
@@ -78,19 +89,6 @@ func (c *Client) Put(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
-// Append appends data to an existing object or creates a new one.
-// Note: S3 doesn't support true append, so this reads, appends, and writes.
-func (c *Client) Append(ctx context.Context, key string, data []byte) error {
-	existing, err := c.Get(ctx, key)
-	if err != nil {
-		// Object doesn't exist, create new
-		return c.Put(ctx, key, data)
-	}
-	// Append to existing
-	combined := append(existing, data...)
-	return c.Put(ctx, key, combined)
-}
-
 // Delete removes an object from S3.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
@@ -130,7 +128,14 @@ func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return false, nil
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			code := apiErr.ErrorCode()
+			if code == "NotFound" || code == "NoSuchKey" {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("failed to check object %s: %w", key, err)
 	}
 	return true, nil
 }
@@ -162,10 +167,5 @@ func WALPrefix(namespace string) string {
 
 // SegmentPath returns the path to a segment file.
 func SegmentPath(namespace, segmentID string) string {
-	return NamespacePath(namespace, path.Join("segments", segmentID+".parquet"))
-}
-
-// IndexPath returns the path to an index file.
-func IndexPath(namespace, segmentID string) string {
-	return NamespacePath(namespace, path.Join("indexes", segmentID+".idx"))
+	return NamespacePath(namespace, path.Join("segments", segmentID+".tpvs"))
 }

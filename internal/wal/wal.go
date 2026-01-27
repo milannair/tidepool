@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,14 +18,14 @@ import (
 	"github.com/tidepool/tidepool/internal/storage"
 )
 
-// Writer handles writing documents to WAL files.
+// Writer handles writing vectors to WAL files.
 type Writer struct {
-	storage   *storage.Client
+	storage   storage.Store
 	namespace string
 }
 
 // NewWriter creates a new WAL writer.
-func NewWriter(storage *storage.Client, namespace string) *Writer {
+func NewWriter(storage storage.Store, namespace string) *Writer {
 	return &Writer{
 		storage:   storage,
 		namespace: namespace,
@@ -33,12 +34,14 @@ func NewWriter(storage *storage.Client, namespace string) *Writer {
 
 // Entry represents a single WAL entry.
 type Entry struct {
-	Timestamp time.Time          `json:"timestamp"`
-	Document  *document.Document `json:"document"`
+	Timestamp time.Time          `json:"ts"`
+	Op        string             `json:"op"` // "upsert" or "delete"
+	Document  *document.Document `json:"doc,omitempty"`
+	DeleteIDs []string           `json:"delete_ids,omitempty"`
 }
 
-// Write appends documents to a new WAL file.
-func (w *Writer) Write(ctx context.Context, docs []document.Document) (string, error) {
+// WriteUpsert appends vectors to a new WAL file.
+func (w *Writer) WriteUpsert(ctx context.Context, docs []document.Document) (string, error) {
 	if len(docs) == 0 {
 		return "", nil
 	}
@@ -53,6 +56,7 @@ func (w *Writer) Write(ctx context.Context, docs []document.Document) (string, e
 	for _, doc := range docs {
 		entry := Entry{
 			Timestamp: time.Now().UTC(),
+			Op:        "upsert",
 			Document:  &doc,
 		}
 		if err := encoder.Encode(entry); err != nil {
@@ -67,14 +71,42 @@ func (w *Writer) Write(ctx context.Context, docs []document.Document) (string, e
 	return walPath, nil
 }
 
+// WriteDelete appends delete operations to a WAL file.
+func (w *Writer) WriteDelete(ctx context.Context, ids []string) (string, error) {
+	if len(ids) == 0 {
+		return "", nil
+	}
+
+	date := time.Now().UTC().Format("2006-01-02")
+	walID := uuid.New().String()
+	walPath := storage.WALPath(w.namespace, date, walID)
+
+	entry := Entry{
+		Timestamp: time.Now().UTC(),
+		Op:        "delete",
+		DeleteIDs: ids,
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(entry); err != nil {
+		return "", fmt.Errorf("failed to encode WAL entry: %w", err)
+	}
+
+	if err := w.storage.Put(ctx, walPath, buf.Bytes()); err != nil {
+		return "", fmt.Errorf("failed to write WAL file: %w", err)
+	}
+
+	return walPath, nil
+}
+
 // Reader handles reading WAL files.
 type Reader struct {
-	storage   *storage.Client
+	storage   storage.Store
 	namespace string
 }
 
 // NewReader creates a new WAL reader.
-func NewReader(storage *storage.Client, namespace string) *Reader {
+func NewReader(storage storage.Store, namespace string) *Reader {
 	return &Reader{
 		storage:   storage,
 		namespace: namespace,
@@ -96,6 +128,7 @@ func (r *Reader) ListWALFiles(ctx context.Context) ([]string, error) {
 			walFiles = append(walFiles, key)
 		}
 	}
+	sort.Strings(walFiles)
 	return walFiles, nil
 }
 
@@ -108,6 +141,11 @@ func (r *Reader) ReadWALFile(ctx context.Context, walPath string) ([]Entry, erro
 
 	var entries []Entry
 	scanner := bufio.NewScanner(bytes.NewReader(data))
+
+	// Increase buffer size for large vectors (10MB)
+	buf := make([]byte, 10*1024*1024)
+	scanner.Buffer(buf, len(buf))
+
 	for scanner.Scan() {
 		var entry Entry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
@@ -145,26 +183,6 @@ func (r *Reader) ReadAllWALFiles(ctx context.Context) ([]Entry, []string, error)
 // DeleteWALFile deletes a WAL file.
 func (r *Reader) DeleteWALFile(ctx context.Context, walPath string) error {
 	return r.storage.Delete(ctx, walPath)
-}
-
-// WALInfo represents information about a WAL file.
-type WALInfo struct {
-	Path      string
-	Date      string
-	EntryCount int
-}
-
-// GetWALInfo parses WAL file path to extract info.
-func GetWALInfo(walPath string) WALInfo {
-	parts := strings.Split(walPath, "/")
-	var date string
-	if len(parts) >= 2 {
-		date = parts[len(parts)-2]
-	}
-	return WALInfo{
-		Path: walPath,
-		Date: date,
-	}
 }
 
 // ExtractDate extracts the date from a WAL path.

@@ -1,23 +1,23 @@
-// Package search implements the search engine for Tidepool.
+// Package search implements the vector search engine for Tidepool.
 package search
 
 import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
+	"sort"
 	"sync"
-	"time"
 
 	"github.com/tidepool/tidepool/internal/document"
 	"github.com/tidepool/tidepool/internal/manifest"
 	"github.com/tidepool/tidepool/internal/segment"
 	"github.com/tidepool/tidepool/internal/storage"
+	"github.com/tidepool/tidepool/internal/vector"
 )
 
-// Engine performs search operations across all segments.
+// Engine performs vector search operations across all segments.
 type Engine struct {
-	storage         *storage.Client
+	storage         storage.Store
 	namespace       string
 	cacheDir        string
 	manifestManager *manifest.Manager
@@ -25,20 +25,18 @@ type Engine struct {
 
 	mu              sync.RWMutex
 	currentManifest *manifest.Manifest
-	loadedSegments  map[string][]*document.Document
-	loadedIndexes   map[string]*segment.Index
+	loadedSegments  map[string]*segment.SegmentData
 }
 
-// NewEngine creates a new search engine.
-func NewEngine(storage *storage.Client, namespace, cacheDir string) *Engine {
+// NewEngine creates a new vector search engine.
+func NewEngine(storage storage.Store, namespace, cacheDir string) *Engine {
 	return &Engine{
 		storage:         storage,
 		namespace:       namespace,
 		cacheDir:        cacheDir,
 		manifestManager: manifest.NewManager(storage, namespace),
 		segmentReader:   segment.NewReader(storage, namespace, cacheDir),
-		loadedSegments:  make(map[string][]*document.Document),
-		loadedIndexes:   make(map[string]*segment.Index),
+		loadedSegments:  make(map[string]*segment.SegmentData),
 	}
 }
 
@@ -53,7 +51,7 @@ func (e *Engine) LoadManifest(ctx context.Context) error {
 	e.currentManifest = m
 	e.mu.Unlock()
 
-	log.Printf("Loaded manifest version %s with %d segments, %d total documents",
+	log.Printf("Loaded manifest version %s with %d segments, %d total vectors",
 		m.Version, len(m.Segments), m.TotalDocCount())
 
 	return nil
@@ -80,228 +78,165 @@ func (e *Engine) EnsureSegmentsLoaded(ctx context.Context) error {
 
 func (e *Engine) loadSegmentIfNeeded(ctx context.Context, seg manifest.Segment) error {
 	e.mu.RLock()
-	_, docsLoaded := e.loadedSegments[seg.ID]
-	_, indexLoaded := e.loadedIndexes[seg.ID]
+	_, loaded := e.loadedSegments[seg.ID]
 	e.mu.RUnlock()
 
-	if docsLoaded && indexLoaded {
+	if loaded {
 		return nil
 	}
 
 	log.Printf("Loading segment %s", seg.ID)
 
-	// Load segment documents
-	if !docsLoaded {
-		docs, err := e.segmentReader.ReadSegment(ctx, seg.SegmentKey)
-		if err != nil {
-			return fmt.Errorf("failed to load segment %s: %w", seg.ID, err)
-		}
-		e.mu.Lock()
-		e.loadedSegments[seg.ID] = docs
-		e.mu.Unlock()
+	segData, err := e.segmentReader.ReadSegment(ctx, seg.SegmentKey)
+	if err != nil {
+		return fmt.Errorf("failed to load segment %s: %w", seg.ID, err)
 	}
 
-	// Load index
-	if !indexLoaded {
-		idx, err := e.segmentReader.ReadIndex(ctx, seg.IndexKey)
-		if err != nil {
-			return fmt.Errorf("failed to load index for segment %s: %w", seg.ID, err)
-		}
-		e.mu.Lock()
-		e.loadedIndexes[seg.ID] = idx
-		e.mu.Unlock()
-	}
+	e.mu.Lock()
+	e.loadedSegments[seg.ID] = segData
+	e.mu.Unlock()
 
 	return nil
 }
 
-// Search performs a search across all segments.
-func (e *Engine) Search(ctx context.Context, req *document.SearchRequest) (*document.SearchResponse, error) {
-	start := time.Now()
-
+// Query performs a vector similarity search.
+func (e *Engine) Query(ctx context.Context, req *document.QueryRequest) (*document.QueryResponse, error) {
 	// Refresh manifest
 	if err := e.LoadManifest(ctx); err != nil {
-		// Continue with existing manifest if refresh fails
 		log.Printf("Warning: failed to refresh manifest: %v", err)
 	}
 
 	// Ensure segments are loaded
 	if err := e.EnsureSegmentsLoaded(ctx); err != nil {
+		// Return empty if no data
+		if e.currentManifest == nil {
+			return &document.QueryResponse{
+				Results:   []document.VectorResult{},
+				Namespace: e.namespace,
+			}, nil
+		}
 		return nil, err
 	}
 
 	e.mu.RLock()
 	m := e.currentManifest
 	segments := e.loadedSegments
-	indexes := e.loadedIndexes
 	e.mu.RUnlock()
 
-	if m == nil {
-		return &document.SearchResponse{
-			Results:   []document.SearchResult{},
-			TotalHits: 0,
-			TookMs:    time.Since(start).Milliseconds(),
-			Query:     req.Query,
+	if m == nil || len(m.Segments) == 0 {
+		return &document.QueryResponse{
+			Results:   []document.VectorResult{},
+			Namespace: e.namespace,
 		}, nil
+	}
+
+	// Set defaults
+	topK := req.TopK
+	if topK <= 0 {
+		topK = 10
+	}
+
+	metric := vector.ParseMetric(req.DistanceMetric)
+
+	// Build filter function
+	var filterFunc func(attrs map[string]interface{}) bool
+	if len(req.Filters) > 0 {
+		filterFunc = buildFilterFunc(req.Filters)
 	}
 
 	// Search across all segments
 	type scoredResult struct {
-		doc   *document.Document
-		score float64
+		id    string
+		vec   []float32
+		attrs map[string]interface{}
+		dist  float32
 	}
 	var allResults []scoredResult
 
 	for _, seg := range m.Segments {
-		idx, ok := indexes[seg.ID]
-		if !ok {
-			continue
-		}
-		docs, ok := segments[seg.ID]
+		segData, ok := segments[seg.ID]
 		if !ok {
 			continue
 		}
 
-		// Apply tag filter if present
-		var candidateDocIDs []string
-		if len(req.Filters.Tags) > 0 {
-			candidateDocIDs = idx.FilterByTags(req.Filters.Tags)
-		}
-
-		// Search within this segment
-		var matchedDocIDs []string
-		if req.Query != "" {
-			matchedDocIDs = idx.Search(req.Query, 0) // No limit yet
-		}
-
-		// Build document map for quick lookup
-		docMap := make(map[string]*document.Document)
-		for _, doc := range docs {
-			docMap[doc.ID] = doc
-		}
-
-		// Combine results
-		if req.Query != "" && len(req.Filters.Tags) > 0 {
-			// Intersection of query results and tag filter
-			tagSet := make(map[string]struct{})
-			for _, id := range candidateDocIDs {
-				tagSet[id] = struct{}{}
+		results := segData.Search(req.Vector, 0, metric, filterFunc) // Get all, sort globally
+		for _, r := range results {
+			sr := scoredResult{
+				id:    segData.IDs[r.Index],
+				attrs: segData.Attributes[r.Index],
+				dist:  r.Dist,
 			}
-
-			for _, docID := range matchedDocIDs {
-				if _, ok := tagSet[docID]; ok {
-					if doc, exists := docMap[docID]; exists {
-						score := calculateScore(doc, req.Query, idx)
-						allResults = append(allResults, scoredResult{doc: doc, score: score})
-					}
-				}
+			if req.IncludeVectors {
+				sr.vec = segData.Vectors[r.Index]
 			}
-		} else if req.Query != "" {
-			// Query only
-			for _, docID := range matchedDocIDs {
-				if doc, exists := docMap[docID]; exists {
-					score := calculateScore(doc, req.Query, idx)
-					allResults = append(allResults, scoredResult{doc: doc, score: score})
-				}
-			}
-		} else if len(req.Filters.Tags) > 0 {
-			// Tags only
-			for _, docID := range candidateDocIDs {
-				if doc, exists := docMap[docID]; exists {
-					allResults = append(allResults, scoredResult{doc: doc, score: 1.0})
-				}
-			}
-		} else {
-			// No query or tags - return all documents
-			for _, doc := range docs {
-				allResults = append(allResults, scoredResult{doc: doc, score: 1.0})
-			}
+			allResults = append(allResults, sr)
 		}
 	}
 
-	// Sort by score descending
-	for i := 0; i < len(allResults); i++ {
-		for j := i + 1; j < len(allResults); j++ {
-			if allResults[j].score > allResults[i].score {
-				allResults[i], allResults[j] = allResults[j], allResults[i]
-			}
-		}
-	}
+	// Sort by distance globally
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].dist < allResults[j].dist
+	})
 
-	totalHits := len(allResults)
-
-	// Apply offset
-	if req.Offset > 0 && req.Offset < len(allResults) {
-		allResults = allResults[req.Offset:]
-	} else if req.Offset >= len(allResults) {
-		allResults = nil
-	}
-
-	// Apply limit
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 10
-	}
-	if len(allResults) > limit {
-		allResults = allResults[:limit]
+	// Take top K
+	if len(allResults) > topK {
+		allResults = allResults[:topK]
 	}
 
 	// Convert to response format
-	results := make([]document.SearchResult, len(allResults))
+	results := make([]document.VectorResult, len(allResults))
 	for i, sr := range allResults {
-		results[i] = document.SearchResult{
-			Document: sr.doc,
-			Score:    sr.score,
+		results[i] = document.VectorResult{
+			ID:         sr.id,
+			Attributes: sr.attrs,
+			Dist:       sr.dist,
+		}
+		if req.IncludeVectors {
+			results[i].Vector = sr.vec
 		}
 	}
 
-	return &document.SearchResponse{
+	return &document.QueryResponse{
 		Results:   results,
-		TotalHits: totalHits,
-		TookMs:    time.Since(start).Milliseconds(),
-		Query:     req.Query,
+		Namespace: e.namespace,
 	}, nil
 }
 
-// calculateScore computes a simple relevance score.
-func calculateScore(doc *document.Document, query string, idx *segment.Index) float64 {
-	queryTerms := segment.Tokenize(query)
-	if len(queryTerms) == 0 {
-		return 0
-	}
-
-	docTerms, ok := idx.DocIDToTerms[doc.ID]
-	if !ok {
-		return 0
-	}
-
-	docTermSet := make(map[string]struct{})
-	for _, term := range docTerms {
-		docTermSet[term] = struct{}{}
-	}
-
-	// Count matching terms
-	var matchCount int
-	for _, qTerm := range queryTerms {
-		if _, ok := docTermSet[qTerm]; ok {
-			matchCount++
+// buildFilterFunc creates a filter function from the filters map.
+// Supports simple equality checks on attributes.
+func buildFilterFunc(filters map[string]interface{}) func(attrs map[string]interface{}) bool {
+	return func(attrs map[string]interface{}) bool {
+		if attrs == nil {
+			return false
 		}
-	}
 
-	// Boost for title matches
-	titleBoost := 1.0
-	if doc.Title != "" {
-		titleLower := strings.ToLower(doc.Title)
-		queryLower := strings.ToLower(query)
-		if strings.Contains(titleLower, queryLower) {
-			titleBoost = 2.0
+		for key, expectedValue := range filters {
+			actualValue, exists := attrs[key]
+			if !exists {
+				return false
+			}
+
+			// Handle array filters (e.g., {"tag": ["a", "b"]} means tag must be in ["a", "b"])
+			if expectedSlice, ok := expectedValue.([]interface{}); ok {
+				found := false
+				for _, v := range expectedSlice {
+					if actualValue == v {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			} else {
+				// Simple equality
+				if actualValue != expectedValue {
+					return false
+				}
+			}
 		}
+		return true
 	}
-
-	// Simple TF-based score
-	score := float64(matchCount) / float64(len(queryTerms)) * titleBoost
-
-	return score
 }
 
 // GetManifest returns the current manifest.
@@ -313,11 +248,12 @@ func (e *Engine) GetManifest() *manifest.Manifest {
 
 // Stats returns search engine statistics.
 type Stats struct {
-	ManifestVersion string `json:"manifest_version"`
+	Namespace       string `json:"namespace"`
+	ManifestVersion string `json:"manifest_version,omitempty"`
 	SegmentCount    int    `json:"segment_count"`
-	TotalDocuments  int64  `json:"total_documents"`
+	TotalVectors    int64  `json:"total_vectors"`
+	Dimensions      int    `json:"dimensions"`
 	LoadedSegments  int    `json:"loaded_segments"`
-	LoadedIndexes   int    `json:"loaded_indexes"`
 }
 
 // GetStats returns current engine statistics.
@@ -325,14 +261,22 @@ func (e *Engine) GetStats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	stats := Stats{}
+	stats := Stats{Namespace: e.namespace}
 	if e.currentManifest != nil {
 		stats.ManifestVersion = e.currentManifest.Version
 		stats.SegmentCount = len(e.currentManifest.Segments)
-		stats.TotalDocuments = e.currentManifest.TotalDocCount()
+		stats.TotalVectors = e.currentManifest.TotalDocCount()
+		stats.Dimensions = e.currentManifest.Dimensions
 	}
 	stats.LoadedSegments = len(e.loadedSegments)
-	stats.LoadedIndexes = len(e.loadedIndexes)
 
 	return stats
+}
+
+// InvalidateCache clears the loaded segments cache.
+func (e *Engine) InvalidateCache() {
+	e.mu.Lock()
+	e.loadedSegments = make(map[string]*segment.SegmentData)
+	e.currentManifest = nil
+	e.mu.Unlock()
 }

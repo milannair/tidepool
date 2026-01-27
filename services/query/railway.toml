@@ -3,6 +3,13 @@
 [build]
 builder = "dockerfile"
 dockerfilePath = "../../Dockerfile.query"
+watchPatterns = [
+  "cmd/tidepool-query/**",
+  "internal/**",
+  "go.mod",
+  "go.sum",
+  "Dockerfile.query"
+]
 
 [deploy]
 restartPolicyType = "on_failure"

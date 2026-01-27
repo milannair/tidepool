@@ -1,56 +1,63 @@
-// Package document defines the core document structure for Tidepool.
+// Package document defines the core document structure for Tidepool vector database.
 package document
 
-import "time"
+// Vector represents a dense vector embedding.
+type Vector []float32
 
-// Document represents a searchable document in Tidepool.
+// Document represents a vector with associated metadata in Tidepool.
 type Document struct {
-	ID        string                 `json:"id" parquet:"id"`
-	Content   string                 `json:"content" parquet:"content"`
-	Title     string                 `json:"title,omitempty" parquet:"title,optional"`
-	URL       string                 `json:"url,omitempty" parquet:"url,optional"`
-	Tags      []string               `json:"tags,omitempty" parquet:"tags,list"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty" parquet:"-"`
-	CreatedAt time.Time              `json:"created_at" parquet:"created_at"`
-	UpdatedAt time.Time              `json:"updated_at" parquet:"updated_at"`
+	ID         string                 `json:"id"`
+	Vector     Vector                 `json:"vector,omitempty"`
+	Attributes map[string]interface{} `json:"attributes,omitempty"`
 }
 
-// SearchResult represents a document with its search score.
-type SearchResult struct {
-	Document *Document `json:"document"`
-	Score    float64   `json:"score"`
+// VectorResult represents a document with its similarity score.
+type VectorResult struct {
+	ID         string                 `json:"id"`
+	Vector     Vector                 `json:"vector,omitempty"`
+	Attributes map[string]interface{} `json:"attributes,omitempty"`
+	Dist       float32                `json:"dist"`
 }
 
-// SearchResponse represents the response from a search query.
-type SearchResponse struct {
-	Results    []SearchResult `json:"results"`
-	TotalHits  int            `json:"total_hits"`
-	TookMs     int64          `json:"took_ms"`
-	Query      string         `json:"query"`
+// QueryRequest represents a vector query.
+type QueryRequest struct {
+	Vector         Vector                 `json:"vector"`
+	TopK           int                    `json:"top_k,omitempty"`
+	DistanceMetric string                 `json:"distance_metric,omitempty"` // cosine, euclidean, dot_product
+	IncludeVectors bool                   `json:"include_vectors,omitempty"`
+	Filters        map[string]interface{} `json:"filters,omitempty"`
 }
 
-// IngestRequest represents a request to ingest documents.
-type IngestRequest struct {
-	Documents []Document `json:"documents"`
+// QueryResponse represents the response from a vector query.
+type QueryResponse struct {
+	Results   []VectorResult `json:"results"`
+	Namespace string         `json:"namespace"`
 }
 
-// IngestResponse represents the response from an ingest request.
-type IngestResponse struct {
-	Ingested int    `json:"ingested"`
-	WALFile  string `json:"wal_file"`
+// UpsertRequest represents a request to upsert vectors.
+type UpsertRequest struct {
+	Vectors      []Document `json:"vectors"`
+	DistanceMetric string   `json:"distance_metric,omitempty"`
 }
 
-// SearchRequest represents a search query.
-type SearchRequest struct {
-	Query   string   `json:"query"`
-	Filters Filters  `json:"filters,omitempty"`
-	Limit   int      `json:"limit,omitempty"`
-	Offset  int      `json:"offset,omitempty"`
+// UpsertResponse represents the response from an upsert request.
+type UpsertResponse struct {
+	Status string `json:"status"`
 }
 
-// Filters represents search filters.
-type Filters struct {
-	Tags      []string `json:"tags,omitempty"`
-	DateFrom  string   `json:"date_from,omitempty"`
-	DateTo    string   `json:"date_to,omitempty"`
+// DeleteRequest represents a request to delete vectors.
+type DeleteRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// DeleteResponse represents the response from a delete request.
+type DeleteResponse struct {
+	Status string `json:"status"`
+}
+
+// NamespaceInfo contains information about a namespace.
+type NamespaceInfo struct {
+	Namespace    string `json:"namespace"`
+	ApproxCount  int64  `json:"approx_count"`
+	Dimensions   int    `json:"dimensions"`
 }
