@@ -1,8 +1,5 @@
 # Railway configuration for tidepool-query service
 
-[root]
-directory = "../.."
-
 [build]
 builder = "dockerfile"
 dockerfilePath = "/Dockerfile.query"
