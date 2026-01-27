@@ -1,0 +1,11 @@
+# Railway configuration for Tidepool
+# This file configures the default service settings
+
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30

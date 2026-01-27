@@ -1,0 +1,11 @@
+# Railway configuration for tidepool-ingest service
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "../../Dockerfile.ingest"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30

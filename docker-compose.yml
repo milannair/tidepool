@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing myminio/tidepool;
+      exit 0;
+      "
+
+  tidepool-query:
+    build:
+      context: .
+      dockerfile: Dockerfile.query
+    ports:
+      - "8080:8080"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_REGION: us-east-1
+      BUCKET_NAME: tidepool
+      CACHE_DIR: /data
+      NAMESPACE: default
+    volumes:
+      - query-cache:/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  tidepool-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    ports:
+      - "8081:8080"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_REGION: us-east-1
+      BUCKET_NAME: tidepool
+      NAMESPACE: default
+      COMPACTION_INTERVAL: 1m
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+volumes:
+  minio-data:
+  query-cache:
