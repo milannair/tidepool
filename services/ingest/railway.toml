@@ -1,5 +1,8 @@
 # Railway configuration for tidepool-ingest service
 
+[root]
+directory = "../.."
+
 [build]
 builder = "dockerfile"
 dockerfilePath = "/Dockerfile.ingest"
