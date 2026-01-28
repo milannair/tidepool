@@ -4,10 +4,15 @@ package segment
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/google/uuid"
@@ -140,6 +145,12 @@ type Reader struct {
 
 // NewReader creates a new segment reader.
 func NewReader(storage storage.Store, namespace, cacheDir string) *Reader {
+	// Ensure cache directory exists
+	if cacheDir != "" {
+		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			log.Printf("Warning: failed to create cache directory %s: %v", cacheDir, err)
+		}
+	}
 	return &Reader{
 		storage:   storage,
 		namespace: namespace,
@@ -147,9 +158,46 @@ func NewReader(storage storage.Store, namespace, cacheDir string) *Reader {
 	}
 }
 
-// ReadSegment reads a segment file into memory.
-func (r *Reader) ReadSegment(ctx context.Context, segmentKey string) (*SegmentData, error) {
+// cacheKeyForSegment generates a cache filename for a segment key.
+func (r *Reader) cacheKeyForSegment(segmentKey string) string {
+	hash := sha256.Sum256([]byte(segmentKey))
+	return hex.EncodeToString(hash[:16]) + ".tpvs"
+}
+
+// getSegmentData retrieves segment data, using disk cache if available.
+func (r *Reader) getSegmentData(ctx context.Context, segmentKey string) ([]byte, error) {
+	// Try disk cache first
+	if r.cacheDir != "" {
+		cachePath := filepath.Join(r.cacheDir, r.cacheKeyForSegment(segmentKey))
+		if data, err := os.ReadFile(cachePath); err == nil {
+			log.Printf("Cache hit for segment %s", segmentKey)
+			return data, nil
+		}
+	}
+
+	// Download from S3
+	log.Printf("Cache miss, downloading segment %s", segmentKey)
 	data, err := r.storage.Get(ctx, segmentKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save to disk cache
+	if r.cacheDir != "" {
+		cachePath := filepath.Join(r.cacheDir, r.cacheKeyForSegment(segmentKey))
+		if err := os.WriteFile(cachePath, data, 0644); err != nil {
+			log.Printf("Warning: failed to cache segment %s: %v", segmentKey, err)
+		} else {
+			log.Printf("Cached segment %s to %s", segmentKey, cachePath)
+		}
+	}
+
+	return data, nil
+}
+
+// ReadSegment reads a segment file into memory, using disk cache if available.
+func (r *Reader) ReadSegment(ctx context.Context, segmentKey string) (*SegmentData, error) {
+	data, err := r.getSegmentData(ctx, segmentKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read segment: %w", err)
 	}
