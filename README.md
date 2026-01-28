@@ -289,13 +289,12 @@ Recommended for ingest:
 ## How It Works
 
 1. **Upsert**: Vectors are written to WAL files in S3
-2. **Compaction**: Background worker merges WAL into segments
-3. **Query**: Loads segments, performs brute-force similarity search
+2. **Compaction**: Background worker merges WAL into segments with HNSW index
+3. **Query**: Loads segments, performs HNSW similarity search
 4. **Delete**: Tombstones written to WAL, applied during compaction
 
 ## Limitations (v0)
 
-- Brute-force search (no ANN index yet)
 - Single namespace per deployment
 - Incremental compaction only (no segment merging yet)
 - No streaming/pagination for large result sets

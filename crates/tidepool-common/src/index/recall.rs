@@ -1,8 +1,11 @@
+//! Recall measurement utilities for ANN index evaluation
+
 use std::collections::HashSet;
 
 use crate::index::hnsw::HnswIndex;
 use crate::vector::{distance, DistanceMetric};
 
+/// Measure recall of HNSW index against exact search results
 pub fn measure_recall(hnsw: &HnswIndex, vectors: &[Vec<f32>], queries: &[Vec<f32>], k: usize) -> f32 {
     if queries.is_empty() || k == 0 {
         return 0.0;
@@ -13,10 +16,10 @@ pub fn measure_recall(hnsw: &HnswIndex, vectors: &[Vec<f32>], queries: &[Vec<f32
 
     for query in queries {
         let hnsw_results = hnsw.search(query, k, 0);
-        let brute_results = brute_force(query, vectors, k, hnsw.metric);
+        let exact_results = exact_search(query, vectors, k, hnsw.metric);
 
         let hnsw_set: HashSet<usize> = hnsw_results.iter().map(|r| r.id).collect();
-        for r in brute_results {
+        for r in exact_results {
             if hnsw_set.contains(&r.0) {
                 correct += 1;
             }
@@ -31,7 +34,8 @@ pub fn measure_recall(hnsw: &HnswIndex, vectors: &[Vec<f32>], queries: &[Vec<f32
     }
 }
 
-pub fn brute_force(
+/// Exact (exhaustive) search for ground truth in recall measurement
+pub fn exact_search(
     query: &[f32],
     vectors: &[Vec<f32>],
     k: usize,

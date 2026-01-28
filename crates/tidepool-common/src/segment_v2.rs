@@ -2,12 +2,13 @@
 //!
 //! Layout:
 //! ```text
-//! [Header: 64 bytes]
+//! [Header: 68 bytes]
 //!   magic: [u8; 4] = "TPV2"
 //!   version: u32 = 2
 //!   vector_count: u32
 //!   dimensions: u32
-//!   flags: u32 (reserved)
+//!   flags: u32
+//!     bit 0: vectors are pre-normalized
 //!   norm_offset: u64
 //!   vector_offset: u64
 //!   id_offset: u64
@@ -28,11 +29,16 @@ use std::io::Read;
 use std::mem;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use roaring::RoaringBitmap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 use crate::document::Document;
+use crate::simd;
 use crate::storage::StorageError;
+
+// Test-only imports
+#[cfg(test)]
+use roaring::RoaringBitmap;
+#[cfg(test)]
 use crate::vector::DistanceMetric;
 
 /// Alignment for vector data (AVX2 friendly)
@@ -44,11 +50,19 @@ const HEADER_SIZE: usize = 68;
 /// Magic bytes for v2 format
 const MAGIC_V2: &[u8; 4] = b"TPV2";
 
+/// Segment flags
+pub mod flags {
+    /// Vectors are pre-normalized to unit length
+    /// When set, cosine distance can use: 1 - dot(a, b)
+    pub const VECTORS_NORMALIZED: u32 = 1 << 0;
+}
+
 /// Zero-copy view over a segment file
 pub struct SegmentView<'a> {
     data: &'a [u8],
     vector_count: usize,
     dimensions: usize,
+    flags: u32,
     attr_offset: usize,
     attr_len: usize,
     norms: &'a [f32],
@@ -211,6 +225,7 @@ impl<'a> SegmentView<'a> {
             data,
             vector_count: n,
             dimensions: d,
+            flags: header.flags,
             attr_offset,
             attr_len,
             norms,
@@ -236,6 +251,12 @@ impl<'a> SegmentView<'a> {
     #[inline]
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+    
+    /// Check if vectors are pre-normalized
+    #[inline]
+    pub fn is_normalized(&self) -> bool {
+        self.flags & flags::VECTORS_NORMALIZED != 0
     }
     
     /// Get vector by index (zero-copy)
@@ -268,9 +289,13 @@ impl<'a> SegmentView<'a> {
     pub fn attr_region(&self) -> (&'a [u8], usize) {
         (&self.data[self.attr_offset..self.attr_offset + self.attr_len], self.attr_len)
     }
-    
-    /// Brute-force search with precomputed norms
-    pub fn search_bruteforce(
+}
+
+// Test-only methods for verifying segment correctness
+#[cfg(test)]
+impl<'a> SegmentView<'a> {
+    /// Linear scan search (test only - production uses HNSW)
+    pub fn linear_scan(
         &self,
         query: &[f32],
         query_norm: f32,
@@ -304,25 +329,24 @@ impl<'a> SegmentView<'a> {
         results
     }
     
-    /// Compute distance with precomputed norms (optimized for cosine)
+    /// Compute distance with precomputed norms
     #[inline]
     fn distance_to(&self, index: usize, query: &[f32], query_norm: f32, metric: DistanceMetric) -> f32 {
         let vec = self.vector(index);
         match metric {
             DistanceMetric::Cosine => {
-                // cosine_distance = 1 - (a·b)/(||a||*||b||)
-                let vec_norm = self.norm(index);
-                if vec_norm == 0.0 || query_norm == 0.0 {
-                    return 2.0;
+                if self.is_normalized() && (query_norm - 1.0).abs() < 0.01 {
+                    simd::cosine_distance_prenorm(query, vec)
+                } else {
+                    let vec_norm = self.norm(index);
+                    simd::cosine_distance_with_norms(query, vec, query_norm, vec_norm)
                 }
-                let dot = dot_product(query, vec);
-                1.0 - dot / (query_norm * vec_norm)
             }
             DistanceMetric::Euclidean => {
-                euclidean_squared(query, vec)
+                simd::l2_squared_f32(query, vec)
             }
             DistanceMetric::DotProduct => {
-                -dot_product(query, vec)
+                -simd::dot_f32(query, vec)
             }
         }
     }
@@ -336,35 +360,10 @@ pub fn hash_id(id: &str) -> u64 {
     hasher.finish()
 }
 
-/// Compute L2 norm of a vector
+/// Compute L2 norm of a vector (SIMD-accelerated)
 #[inline]
 pub fn compute_norm(vec: &[f32]) -> f32 {
-    let mut sum = 0.0f64;
-    for &v in vec {
-        sum += (v as f64) * (v as f64);
-    }
-    sum.sqrt() as f32
-}
-
-/// Dot product (scalar fallback)
-#[inline]
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        sum += (*x as f64) * (*y as f64);
-    }
-    sum as f32
-}
-
-/// Squared Euclidean distance
-#[inline]
-fn euclidean_squared(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let diff = (*x as f64) - (*y as f64);
-        sum += diff * diff;
-    }
-    sum as f32
+    simd::l2_norm_f32(vec)
 }
 
 /// Align offset to boundary
@@ -373,8 +372,22 @@ fn align_to(offset: usize, alignment: usize) -> usize {
     (offset + alignment - 1) & !(alignment - 1)
 }
 
+/// Options for writing segment v2 files
+#[derive(Debug, Clone, Default)]
+pub struct WriteOptions {
+    /// Pre-normalize vectors before writing
+    /// When true, vectors are normalized to unit length and the VECTORS_NORMALIZED flag is set.
+    /// This enables faster cosine distance computation: 1 - dot(a, b)
+    pub normalize_vectors: bool,
+}
+
 /// Write a v2 segment file
 pub fn write_segment_v2(docs: &[Document]) -> Result<Vec<u8>, StorageError> {
+    write_segment_v2_with_options(docs, &WriteOptions::default())
+}
+
+/// Write a v2 segment file with options
+pub fn write_segment_v2_with_options(docs: &[Document], opts: &WriteOptions) -> Result<Vec<u8>, StorageError> {
     if docs.is_empty() {
         return Err(StorageError::Other("no documents".into()));
     }
@@ -438,12 +451,19 @@ pub fn write_segment_v2(docs: &[Document]) -> Result<Vec<u8>, StorageError> {
     let total_size = attr_offset + attr_len;
     let mut buf = vec![0u8; total_size];
     
+    // Set flags
+    let segment_flags = if opts.normalize_vectors {
+        flags::VECTORS_NORMALIZED
+    } else {
+        0
+    };
+    
     // Write header
     buf[0..4].copy_from_slice(MAGIC_V2);
     (&mut buf[4..8]).write_u32::<LittleEndian>(2).unwrap();
     (&mut buf[8..12]).write_u32::<LittleEndian>(n as u32).unwrap();
     (&mut buf[12..16]).write_u32::<LittleEndian>(d as u32).unwrap();
-    (&mut buf[16..20]).write_u32::<LittleEndian>(0).unwrap(); // flags
+    (&mut buf[16..20]).write_u32::<LittleEndian>(segment_flags).unwrap();
     (&mut buf[20..28]).write_u64::<LittleEndian>(norm_offset as u64).unwrap();
     (&mut buf[28..36]).write_u64::<LittleEndian>(vector_offset as u64).unwrap();
     (&mut buf[36..44]).write_u64::<LittleEndian>(id_offset as u64).unwrap();
@@ -451,20 +471,47 @@ pub fn write_segment_v2(docs: &[Document]) -> Result<Vec<u8>, StorageError> {
     (&mut buf[52..60]).write_u64::<LittleEndian>(attr_offset as u64).unwrap();
     (&mut buf[60..68]).write_u64::<LittleEndian>(attr_len as u64).unwrap();
     
-    // Write norms
+    // Write norms and optionally normalized vectors
     let mut offset = norm_offset;
-    for doc in docs {
-        let norm = compute_norm(&doc.vector);
-        (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(norm).unwrap();
-        offset += 4;
-    }
     
-    // Write vectors
-    offset = vector_offset;
-    for doc in docs {
-        for &v in &doc.vector {
-            (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(v).unwrap();
+    if opts.normalize_vectors {
+        // Compute norms first, then write normalized vectors
+        let mut normalized_vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for doc in docs {
+            let norm = simd::l2_norm_f32(&doc.vector);
+            (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(1.0).unwrap(); // norm is 1 after normalization
             offset += 4;
+            
+            if norm == 0.0 {
+                normalized_vecs.push(doc.vector.clone());
+            } else {
+                normalized_vecs.push(simd::normalized_f32(&doc.vector));
+            }
+        }
+        
+        // Write normalized vectors
+        offset = vector_offset;
+        for vec in &normalized_vecs {
+            for &v in vec {
+                (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(v).unwrap();
+                offset += 4;
+            }
+        }
+    } else {
+        // Write original norms
+        for doc in docs {
+            let norm = simd::l2_norm_f32(&doc.vector);
+            (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(norm).unwrap();
+            offset += 4;
+        }
+        
+        // Write original vectors
+        offset = vector_offset;
+        for doc in docs {
+            for &v in &doc.vector {
+                (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(v).unwrap();
+                offset += 4;
+            }
         }
     }
     
@@ -516,6 +563,7 @@ mod tests {
         let view = unsafe { SegmentView::from_bytes(&data).unwrap() };
         assert_eq!(view.len(), 2);
         assert_eq!(view.dimensions(), 3);
+        assert!(!view.is_normalized());
         
         assert_eq!(view.id_string(0), Some("doc1"));
         assert_eq!(view.id_string(1), Some("doc2"));
@@ -525,6 +573,41 @@ mod tests {
         
         // Check norm
         assert!((view.norm(0) - 1.0).abs() < 0.001);
+    }
+    
+    #[test]
+    fn test_roundtrip_normalized() {
+        let docs = vec![
+            Document {
+                id: "doc1".to_string(),
+                vector: vec![3.0, 4.0, 0.0],
+                attributes: None,
+            },
+            Document {
+                id: "doc2".to_string(),
+                vector: vec![0.0, 5.0, 12.0],
+                attributes: None,
+            },
+        ];
+        
+        let opts = WriteOptions { normalize_vectors: true };
+        let data = write_segment_v2_with_options(&docs, &opts).unwrap();
+        
+        let view = unsafe { SegmentView::from_bytes(&data).unwrap() };
+        assert!(view.is_normalized());
+        
+        // Check norms are 1.0
+        assert!((view.norm(0) - 1.0).abs() < 0.001);
+        assert!((view.norm(1) - 1.0).abs() < 0.001);
+        
+        // Check vectors are normalized
+        let v0 = view.vector(0);
+        let v0_norm = simd::l2_norm_f32(v0);
+        assert!((v0_norm - 1.0).abs() < 0.001, "vector 0 norm: {}", v0_norm);
+        
+        // Original: [3, 4, 0], norm = 5, normalized = [0.6, 0.8, 0]
+        assert!((v0[0] - 0.6).abs() < 0.001);
+        assert!((v0[1] - 0.8).abs() < 0.001);
     }
     
     #[test]
@@ -553,7 +636,40 @@ mod tests {
         let query = vec![1.0, 0.0];
         let query_norm = compute_norm(&query);
         
-        let results = view.search_bruteforce(&query, query_norm, 2, DistanceMetric::Cosine, None);
+        let results = view.linear_scan(&query, query_norm, 2, DistanceMetric::Cosine, None);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 0); // "a" is closest
+    }
+    
+    #[test]
+    fn test_search_normalized() {
+        let docs = vec![
+            Document {
+                id: "a".to_string(),
+                vector: vec![1.0, 0.0],
+                attributes: None,
+            },
+            Document {
+                id: "b".to_string(),
+                vector: vec![0.0, 1.0],
+                attributes: None,
+            },
+            Document {
+                id: "c".to_string(),
+                vector: vec![0.7, 0.7],
+                attributes: None,
+            },
+        ];
+        
+        let opts = WriteOptions { normalize_vectors: true };
+        let data = write_segment_v2_with_options(&docs, &opts).unwrap();
+        let view = unsafe { SegmentView::from_bytes(&data).unwrap() };
+        
+        // Query should also be normalized for fast path
+        let query = simd::normalized_f32(&[1.0, 0.0]);
+        let query_norm = 1.0;
+        
+        let results = view.linear_scan(&query, query_norm, 2, DistanceMetric::Cosine, None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 0); // "a" is closest
     }
