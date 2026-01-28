@@ -18,20 +18,24 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o tidepool-query \
     ./query/cmd/query
 
-# Final stage - distroless for minimal attack surface
-FROM gcr.io/distroless/static:nonroot
+# Final stage - minimal alpine for volume support
+FROM alpine:3.20
+
+# Install CA certificates
+RUN apk add --no-cache ca-certificates
+
+# Create non-root user and data directory
+RUN adduser -D -u 1000 tidepool && \
+    mkdir -p /data && \
+    chown -R tidepool:tidepool /data
 
 # Copy the binary
 COPY --from=builder /build/tidepool-query /tidepool-query
 
-# Copy CA certificates for HTTPS
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-
-# Create data directory
 WORKDIR /
 
 # Run as non-root user
-USER nonroot:nonroot
+USER tidepool
 
 EXPOSE 8080
 
