@@ -1,10 +1,11 @@
 //! SIMD-accelerated distance kernels
 //!
-//! Provides AVX2/FMA implementations for dot product and L2 squared distance
-//! with automatic fallback to scalar implementations on unsupported hardware.
+//! Provides AVX2/FMA (x86_64) and NEON (ARM64) implementations for dot product
+//! and L2 squared distance with automatic fallback to scalar implementations.
 //!
 //! # Performance
 //! - AVX2 processes 8 f32 values per instruction (256-bit registers)
+//! - NEON processes 4 f32 values per instruction (128-bit registers)
 //! - FMA (Fused Multiply-Add) reduces latency for multiply-accumulate operations
 //! - Loop unrolling processes 32 floats per iteration for better instruction pipelining
 //!
@@ -22,12 +23,14 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Feature detection state
-/// 0 = unknown, 1 = AVX2+FMA available, 2 = scalar only
+/// 0 = unknown, 1 = AVX2+FMA available (x86_64), 2 = NEON available (ARM64), 3 = scalar only
 static SIMD_LEVEL: AtomicU8 = AtomicU8::new(0);
 
 const SIMD_UNKNOWN: u8 = 0;
 const SIMD_AVX2_FMA: u8 = 1;
-const SIMD_SCALAR: u8 = 2;
+const SIMD_NEON: u8 = 2;
+#[allow(dead_code)]
+const SIMD_SCALAR: u8 = 3;
 
 /// Detect SIMD capabilities at runtime
 #[inline]
@@ -60,17 +63,37 @@ fn detect_simd() -> u8 {
         return level;
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on aarch64
+        SIMD_LEVEL.store(SIMD_NEON, Ordering::Relaxed);
+        return SIMD_NEON;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         SIMD_LEVEL.store(SIMD_SCALAR, Ordering::Relaxed);
         SIMD_SCALAR
     }
 }
 
-/// Check if AVX2+FMA is available
+/// Check if AVX2+FMA is available (x86_64)
 #[inline]
 pub fn has_avx2_fma() -> bool {
     detect_simd() == SIMD_AVX2_FMA
+}
+
+/// Check if NEON is available (ARM64)
+#[inline]
+pub fn has_neon() -> bool {
+    detect_simd() == SIMD_NEON
+}
+
+/// Check if any SIMD acceleration is available
+#[inline]
+pub fn has_simd() -> bool {
+    let level = detect_simd();
+    level == SIMD_AVX2_FMA || level == SIMD_NEON
 }
 
 // ============================================================================
@@ -79,7 +102,7 @@ pub fn has_avx2_fma() -> bool {
 
 /// Compute dot product of two f32 slices
 ///
-/// Automatically uses AVX2+FMA when available, falls back to scalar otherwise.
+/// Automatically uses AVX2+FMA or NEON when available, falls back to scalar otherwise.
 /// Returns 0.0 if slices have different lengths or are empty.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -87,11 +110,21 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
+    let level = detect_simd();
+
     #[cfg(target_arch = "x86_64")]
     {
-        if detect_simd() == SIMD_AVX2_FMA {
+        if level == SIMD_AVX2_FMA {
             // Safety: we've verified AVX2+FMA support at runtime
             return unsafe { dot_f32_avx2(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if level == SIMD_NEON {
+            // Safety: NEON is always available on aarch64
+            return unsafe { neon::dot_f32_neon_impl(a, b) };
         }
     }
 
@@ -100,7 +133,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// Compute squared L2 (Euclidean) distance between two f32 slices
 ///
-/// Automatically uses AVX2+FMA when available, falls back to scalar otherwise.
+/// Automatically uses AVX2+FMA or NEON when available, falls back to scalar otherwise.
 /// Returns f32::MAX if slices have different lengths.
 #[inline]
 pub fn l2_squared_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -111,11 +144,21 @@ pub fn l2_squared_f32(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
+    let level = detect_simd();
+
     #[cfg(target_arch = "x86_64")]
     {
-        if detect_simd() == SIMD_AVX2_FMA {
+        if level == SIMD_AVX2_FMA {
             // Safety: we've verified AVX2+FMA support at runtime
             return unsafe { l2_squared_f32_avx2(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if level == SIMD_NEON {
+            // Safety: NEON is always available on aarch64
+            return unsafe { neon::l2_squared_f32_neon_impl(a, b) };
         }
     }
 
@@ -153,11 +196,21 @@ pub fn l2_norm_f32(v: &[f32]) -> f32 {
         return 0.0;
     }
 
+    let level = detect_simd();
+
     #[cfg(target_arch = "x86_64")]
     {
-        if detect_simd() == SIMD_AVX2_FMA {
+        if level == SIMD_AVX2_FMA {
             // Safety: we've verified AVX2+FMA support at runtime
             return unsafe { l2_norm_f32_avx2(v) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if level == SIMD_NEON {
+            // Safety: NEON is always available on aarch64
+            return unsafe { neon::l2_norm_f32_neon_impl(v) };
         }
     }
 
@@ -504,6 +557,217 @@ unsafe fn l2_squared_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 unsafe fn l2_norm_f32_avx2(v: &[f32]) -> f32 {
     avx2::l2_norm_f32_avx2_impl(v)
+}
+
+// ============================================================================
+// NEON (ARM64) implementations
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    /// NEON dot product
+    ///
+    /// Processes 16 floats per iteration (4 × 4-wide NEON registers)
+    ///
+    /// # Safety
+    /// Caller must ensure aarch64 target with NEON support
+    #[inline]
+    pub unsafe fn dot_f32_neon_impl(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        // Initialize 4 accumulators for better pipelining
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        // Process 16 elements per iteration (4 × 4)
+        let chunks = n / 16;
+        for i in 0..chunks {
+            let base = i * 16;
+
+            // Load 16 elements from each array
+            let a0 = vld1q_f32(a_ptr.add(base));
+            let a1 = vld1q_f32(a_ptr.add(base + 4));
+            let a2 = vld1q_f32(a_ptr.add(base + 8));
+            let a3 = vld1q_f32(a_ptr.add(base + 12));
+
+            let b0 = vld1q_f32(b_ptr.add(base));
+            let b1 = vld1q_f32(b_ptr.add(base + 4));
+            let b2 = vld1q_f32(b_ptr.add(base + 8));
+            let b3 = vld1q_f32(b_ptr.add(base + 12));
+
+            // FMA: acc = acc + a * b
+            acc0 = vfmaq_f32(acc0, a0, b0);
+            acc1 = vfmaq_f32(acc1, a1, b1);
+            acc2 = vfmaq_f32(acc2, a2, b2);
+            acc3 = vfmaq_f32(acc3, a3, b3);
+        }
+
+        // Process remaining 4-element chunks
+        let remainder_base = chunks * 16;
+        let remaining = n - remainder_base;
+        let remaining_chunks = remaining / 4;
+
+        for i in 0..remaining_chunks {
+            let base = remainder_base + i * 4;
+            let av = vld1q_f32(a_ptr.add(base));
+            let bv = vld1q_f32(b_ptr.add(base));
+            acc0 = vfmaq_f32(acc0, av, bv);
+        }
+
+        // Combine accumulators
+        acc0 = vaddq_f32(acc0, acc1);
+        acc2 = vaddq_f32(acc2, acc3);
+        acc0 = vaddq_f32(acc0, acc2);
+
+        // Horizontal sum of 4 f32 values
+        let sum = vaddvq_f32(acc0);
+
+        // Handle final scalar elements
+        let scalar_base = remainder_base + remaining_chunks * 4;
+        let mut scalar_sum = sum;
+        for i in scalar_base..n {
+            scalar_sum += *a_ptr.add(i) * *b_ptr.add(i);
+        }
+
+        scalar_sum
+    }
+
+    /// NEON squared L2 distance
+    ///
+    /// Computes sum((a[i] - b[i])^2)
+    ///
+    /// # Safety
+    /// Caller must ensure aarch64 target with NEON support
+    #[inline]
+    pub unsafe fn l2_squared_f32_neon_impl(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        // Process 16 elements per iteration
+        let chunks = n / 16;
+        for i in 0..chunks {
+            let base = i * 16;
+
+            let a0 = vld1q_f32(a_ptr.add(base));
+            let a1 = vld1q_f32(a_ptr.add(base + 4));
+            let a2 = vld1q_f32(a_ptr.add(base + 8));
+            let a3 = vld1q_f32(a_ptr.add(base + 12));
+
+            let b0 = vld1q_f32(b_ptr.add(base));
+            let b1 = vld1q_f32(b_ptr.add(base + 4));
+            let b2 = vld1q_f32(b_ptr.add(base + 8));
+            let b3 = vld1q_f32(b_ptr.add(base + 12));
+
+            // Compute differences
+            let d0 = vsubq_f32(a0, b0);
+            let d1 = vsubq_f32(a1, b1);
+            let d2 = vsubq_f32(a2, b2);
+            let d3 = vsubq_f32(a3, b3);
+
+            // FMA: acc = acc + d * d
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            acc2 = vfmaq_f32(acc2, d2, d2);
+            acc3 = vfmaq_f32(acc3, d3, d3);
+        }
+
+        // Process remaining 4-element chunks
+        let remainder_base = chunks * 16;
+        let remaining = n - remainder_base;
+        let remaining_chunks = remaining / 4;
+
+        for i in 0..remaining_chunks {
+            let base = remainder_base + i * 4;
+            let av = vld1q_f32(a_ptr.add(base));
+            let bv = vld1q_f32(b_ptr.add(base));
+            let d = vsubq_f32(av, bv);
+            acc0 = vfmaq_f32(acc0, d, d);
+        }
+
+        // Combine accumulators
+        acc0 = vaddq_f32(acc0, acc1);
+        acc2 = vaddq_f32(acc2, acc3);
+        acc0 = vaddq_f32(acc0, acc2);
+
+        let sum = vaddvq_f32(acc0);
+
+        // Handle final scalar elements
+        let scalar_base = remainder_base + remaining_chunks * 4;
+        let mut scalar_sum = sum;
+        for i in scalar_base..n {
+            let d = *a_ptr.add(i) - *b_ptr.add(i);
+            scalar_sum += d * d;
+        }
+
+        scalar_sum
+    }
+
+    /// NEON L2 norm (magnitude)
+    ///
+    /// # Safety
+    /// Caller must ensure aarch64 target with NEON support
+    #[inline]
+    pub unsafe fn l2_norm_f32_neon_impl(v: &[f32]) -> f32 {
+        let n = v.len();
+        let v_ptr = v.as_ptr();
+
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+
+        let chunks = n / 16;
+        for i in 0..chunks {
+            let base = i * 16;
+
+            let v0 = vld1q_f32(v_ptr.add(base));
+            let v1 = vld1q_f32(v_ptr.add(base + 4));
+            let v2 = vld1q_f32(v_ptr.add(base + 8));
+            let v3 = vld1q_f32(v_ptr.add(base + 12));
+
+            acc0 = vfmaq_f32(acc0, v0, v0);
+            acc1 = vfmaq_f32(acc1, v1, v1);
+            acc2 = vfmaq_f32(acc2, v2, v2);
+            acc3 = vfmaq_f32(acc3, v3, v3);
+        }
+
+        let remainder_base = chunks * 16;
+        let remaining = n - remainder_base;
+        let remaining_chunks = remaining / 4;
+
+        for i in 0..remaining_chunks {
+            let base = remainder_base + i * 4;
+            let vv = vld1q_f32(v_ptr.add(base));
+            acc0 = vfmaq_f32(acc0, vv, vv);
+        }
+
+        acc0 = vaddq_f32(acc0, acc1);
+        acc2 = vaddq_f32(acc2, acc3);
+        acc0 = vaddq_f32(acc0, acc2);
+
+        let sum = vaddvq_f32(acc0);
+
+        let scalar_base = remainder_base + remaining_chunks * 4;
+        let mut scalar_sum = sum;
+        for i in scalar_base..n {
+            let x = *v_ptr.add(i);
+            scalar_sum += x * x;
+        }
+
+        scalar_sum.sqrt()
+    }
 }
 
 // ============================================================================

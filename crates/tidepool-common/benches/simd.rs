@@ -277,9 +277,14 @@ fn bench_throughput_128d(c: &mut Criterion) {
 
 /// Report SIMD availability
 fn bench_simd_info(c: &mut Criterion) {
-    let has_simd = simd::has_avx2_fma();
+    let has_avx2 = simd::has_avx2_fma();
+    let has_neon = simd::has_neon();
+    let has_any_simd = simd::has_simd();
+    
     println!("\n=== SIMD Info ===");
-    println!("AVX2+FMA available: {}", has_simd);
+    println!("AVX2+FMA available: {}", has_avx2);
+    println!("NEON available: {}", has_neon);
+    println!("SIMD acceleration: {}", if has_any_simd { "YES" } else { "NO (scalar fallback)" });
 
     // Quick sanity check
     let a = vec![1.0; 128];
@@ -290,7 +295,7 @@ fn bench_simd_info(c: &mut Criterion) {
 
     // Minimal benchmark to keep criterion happy
     c.bench_function("simd_available", |bench| {
-        bench.iter(|| simd::has_avx2_fma())
+        bench.iter(|| simd::has_simd())
     });
 }
 
