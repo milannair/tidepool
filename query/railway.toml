@@ -13,7 +13,7 @@ watchPatterns = [
 ]
 
 [env]
-RAILWAY_DOCKERFILE_PATH = "/query/Dockerfile"
+RAILWAY_DOCKERFILE_PATH = "query/Dockerfile"
 
 [deploy]
 restartPolicyType = "on_failure"

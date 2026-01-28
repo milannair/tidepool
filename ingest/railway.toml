@@ -13,7 +13,7 @@ watchPatterns = [
 ]
 
 [env]
-RAILWAY_DOCKERFILE_PATH = "/ingest/Dockerfile"
+RAILWAY_DOCKERFILE_PATH = "ingest/Dockerfile"
 
 [deploy]
 restartPolicyType = "on_failure"
