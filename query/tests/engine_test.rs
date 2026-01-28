@@ -1,11 +1,18 @@
-use serde_json::json;
+use std::collections::BTreeMap;
 
+use tidepool_common::attributes::AttrValue;
 use tidepool_common::document::{Document, QueryRequest};
 use tidepool_common::manifest::{Manager, Manifest, Segment};
 use tidepool_common::segment::Writer;
 use tidepool_common::storage::InMemoryStore;
 
 use tidepool_query::engine::Engine;
+
+fn tag_attr(value: &str) -> AttrValue {
+    let mut map = BTreeMap::new();
+    map.insert("tag".to_string(), AttrValue::String(value.to_string()));
+    AttrValue::Object(map)
+}
 
 #[tokio::test]
 async fn engine_query_with_filters() {
@@ -17,12 +24,12 @@ async fn engine_query_with_filters() {
         Document {
             id: "a".to_string(),
             vector: vec![1.0, 0.0],
-            attributes: Some(json!({"tag": "x"})),
+            attributes: Some(tag_attr("x")),
         },
         Document {
             id: "b".to_string(),
             vector: vec![0.0, 1.0],
-            attributes: Some(json!({"tag": "y"})),
+            attributes: Some(tag_attr("y")),
         },
     ];
 
@@ -45,7 +52,7 @@ async fn engine_query_with_filters() {
         ef_search: 0,
         distance_metric: None,
         include_vectors: false,
-        filters: Some(json!({"tag": "x"})),
+        filters: Some(tag_attr("x")),
     };
 
     let resp = engine.query(&req).await.unwrap();

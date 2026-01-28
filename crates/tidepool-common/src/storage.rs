@@ -208,7 +208,7 @@ pub fn namespace_path(namespace: &str, subpath: &str) -> String {
 }
 
 pub fn manifest_path(namespace: &str, version: &str) -> String {
-    namespace_path(namespace, &format!("manifests/{}.json", version))
+    namespace_path(namespace, &format!("manifests/{}.rkyv", version))
 }
 
 pub fn latest_manifest_path(namespace: &str) -> String {
@@ -216,7 +216,7 @@ pub fn latest_manifest_path(namespace: &str) -> String {
 }
 
 pub fn wal_path(namespace: &str, date: &str, uuid: &str) -> String {
-    namespace_path(namespace, &format!("wal/{}/{}.jsonl", date, uuid))
+    namespace_path(namespace, &format!("wal/{}/{}.wal", date, uuid))
 }
 
 pub fn wal_prefix(namespace: &str) -> String {
