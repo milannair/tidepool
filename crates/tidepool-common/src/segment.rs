@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hex::encode as hex_encode;
 use memmap2::Mmap;
+use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
@@ -16,9 +18,10 @@ use tokio::fs;
 use crate::attributes::AttrValue;
 use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
+use crate::index::ivf::IVFIndex;
 use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentView};
-use crate::storage::{segment_index_path, segment_path, Store, StorageError};
-use crate::vector::DistanceMetric;
+use crate::storage::{segment_index_path, segment_ivf_path, segment_path, Store, StorageError};
+use crate::vector::{distance_with_norms, DistanceMetric};
 
 /// Segment data - supports both owned (v1) and zero-copy (v2) modes
 #[derive(Clone)]
@@ -33,6 +36,8 @@ pub struct SegmentData {
     pub dimensions: usize,
     /// HNSW index for ANN search
     pub index: Option<HnswIndex>,
+    /// IVF index for ANN search (large segments)
+    pub ivf_index: Option<IVFIndex>,
     /// Filter index for attribute queries
     pub filters: Option<FilterIndex>,
     /// Raw segment data for zero-copy v2 access (kept for lifetime)
@@ -52,6 +57,7 @@ impl std::fmt::Debug for SegmentData {
             .field("vectors_len", &self.vectors.len())
             .field("dimensions", &self.dimensions)
             .field("has_index", &self.index.is_some())
+            .field("has_ivf", &self.ivf_index.is_some())
             .field("is_v2", &self.is_v2)
             .finish()
     }
@@ -74,6 +80,22 @@ pub struct WriterOptions {
     pub metric: DistanceMetric,
     /// Use v2 zero-copy format (default: true)
     pub use_v2_format: bool,
+    /// Enable IVF index build
+    pub ivf_enabled: bool,
+    /// Minimum vectors required to build IVF (otherwise HNSW)
+    pub ivf_min_segment_size: usize,
+    /// IVF k scaling factor (k ≈ sqrt(n) * factor)
+    pub ivf_k_factor: f32,
+    /// IVF k lower bound
+    pub ivf_min_k: usize,
+    /// IVF k upper bound
+    pub ivf_max_k: usize,
+    /// IVF default nprobe (stored in index)
+    pub ivf_nprobe_default: usize,
+    /// IVF k-means iterations
+    pub ivf_max_iters: usize,
+    /// IVF deterministic seed
+    pub ivf_seed: u64,
 }
 
 impl Default for WriterOptions {
@@ -84,6 +106,14 @@ impl Default for WriterOptions {
             hnsw_ef_search: DEFAULT_EF_SEARCH,
             metric: DistanceMetric::Cosine,
             use_v2_format: true,
+            ivf_enabled: true,
+            ivf_min_segment_size: 10_000,
+            ivf_k_factor: 1.0,
+            ivf_min_k: 16,
+            ivf_max_k: 65_535,
+            ivf_nprobe_default: 10,
+            ivf_max_iters: 25,
+            ivf_seed: 42,
         }
     }
 }
@@ -146,27 +176,55 @@ impl<S: Store> Writer<S> {
             self.write_segment_v1(docs, dimensions)?
         };
 
-        // Build HNSW index
-        let mut hnsw = HnswIndex::new(
-            self.opts.hnsw_m,
-            self.opts.hnsw_ef_construction,
-            self.opts.hnsw_ef_search,
-            self.opts.metric,
-        );
-        for (i, doc) in docs.iter().enumerate() {
-            hnsw.insert(i, doc.vector.clone());
-        }
-        let hnsw_data = hnsw
-            .marshal_binary()
-            .map_err(|e| StorageError::Other(format!("serialize HNSW: {}", e)))?;
-
         let segment_key = segment_path(&self.namespace, &segment_id);
         self.storage.put(&segment_key, buf).await?;
 
-        let index_key = segment_index_path(&self.namespace, &segment_id);
-        if let Err(err) = self.storage.put(&index_key, hnsw_data).await {
-            let _ = self.storage.delete(&segment_key).await;
-            return Err(err);
+        let use_ivf = self.opts.ivf_enabled && docs.len() >= self.opts.ivf_min_segment_size;
+        if use_ivf {
+            let vector_refs: Vec<&[f32]> = docs.iter().map(|d| d.vector.as_slice()).collect();
+            let k = IVFIndex::compute_k(
+                vector_refs.len(),
+                self.opts.ivf_k_factor,
+                self.opts.ivf_min_k,
+                self.opts.ivf_max_k,
+            );
+            let ivf = IVFIndex::build(
+                &vector_refs,
+                self.opts.metric,
+                k,
+                self.opts.ivf_nprobe_default,
+                self.opts.ivf_max_iters,
+                self.opts.ivf_seed,
+            )
+            .map_err(|e| StorageError::Other(format!("build IVF: {}", e)))?;
+            let ivf_data = ivf
+                .marshal_binary()
+                .map_err(|e| StorageError::Other(format!("serialize IVF: {}", e)))?;
+            let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
+            if let Err(err) = self.storage.put(&ivf_key, ivf_data).await {
+                let _ = self.storage.delete(&segment_key).await;
+                return Err(err);
+            }
+        } else {
+            // Build HNSW index
+            let mut hnsw = HnswIndex::new(
+                self.opts.hnsw_m,
+                self.opts.hnsw_ef_construction,
+                self.opts.hnsw_ef_search,
+                self.opts.metric,
+            );
+            for (i, doc) in docs.iter().enumerate() {
+                hnsw.insert(i, doc.vector.clone());
+            }
+            let hnsw_data = hnsw
+                .marshal_binary()
+                .map_err(|e| StorageError::Other(format!("serialize HNSW: {}", e)))?;
+
+            let index_key = segment_index_path(&self.namespace, &segment_id);
+            if let Err(err) = self.storage.put(&index_key, hnsw_data).await {
+                let _ = self.storage.delete(&segment_key).await;
+                return Err(err);
+            }
         }
 
         Ok(Some(ManifestSegment {
@@ -331,6 +389,7 @@ impl<S: Store> Reader<S> {
             attributes: attrs,
             dimensions,
             index: None,
+            ivf_index: None,
             filters: None,
             raw_data: Some(data),
             norms,
@@ -346,6 +405,14 @@ impl<S: Store> Reader<S> {
                         HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
                     {
                         seg.index = Some(hnsw);
+                    }
+                }
+            }
+            let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
+            if self.storage.exists(&ivf_key).await.unwrap_or(false) {
+                if let Ok(ivf_data) = self.get_ivf_data(&ivf_key).await {
+                    if let Ok(ivf) = IVFIndex::load_binary(ivf_data.as_slice()) {
+                        seg.ivf_index = Some(ivf);
                     }
                 }
             }
@@ -437,6 +504,7 @@ impl<S: Store> Reader<S> {
             attributes: attrs,
             dimensions,
             index: None,
+            ivf_index: None,
             filters: None,
             raw_data: None,
             norms,
@@ -451,6 +519,14 @@ impl<S: Store> Reader<S> {
                         HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
                     {
                         seg.index = Some(hnsw);
+                    }
+                }
+            }
+            let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
+            if self.storage.exists(&ivf_key).await.unwrap_or(false) {
+                if let Ok(ivf_data) = self.get_ivf_data(&ivf_key).await {
+                    if let Ok(ivf) = IVFIndex::load_binary(ivf_data.as_slice()) {
+                        seg.ivf_index = Some(ivf);
                     }
                 }
             }
@@ -496,6 +572,24 @@ impl<S: Store> Reader<S> {
         Ok(SegmentBytes::Owned(data))
     }
 
+    async fn get_ivf_data(&self, ivf_key: &str) -> Result<SegmentBytes, StorageError> {
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(ivf_key, "ivf"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
+            if let Ok(data) = fs::read(&cache_path).await {
+                return Ok(SegmentBytes::Owned(data));
+            }
+        }
+        let data = self.storage.get(ivf_key).await?;
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(ivf_key, "ivf"));
+            let _ = fs::write(cache_path, &data).await;
+        }
+        Ok(SegmentBytes::Owned(data))
+    }
+
     /// Remove cached files for segments not in the valid set.
     /// Call this after loading a new manifest to clean up stale cache entries.
     /// Returns the number of files removed.
@@ -521,8 +615,8 @@ impl<S: Store> Reader<S> {
                 continue;
             };
 
-            // Only process our cache files (.tpvs, .hnsw)
-            if !filename.ends_with(".tpvs") && !filename.ends_with(".hnsw") {
+            // Only process our cache files (.tpvs, .hnsw, .ivf)
+            if !filename.ends_with(".tpvs") && !filename.ends_with(".hnsw") && !filename.ends_with(".ivf") {
                 continue;
             }
 
@@ -620,8 +714,13 @@ impl SegmentData {
         metric: DistanceMetric,
         filters: Option<&AttrValue>,
         ef_search: usize,
+        nprobe: usize,
     ) -> Vec<ScoredResult> {
         let top_k = if top_k == 0 { self.vectors.len() } else { top_k };
+
+        if let Some(ivf) = &self.ivf_index {
+            return self.ivf_search(query, top_k, ivf.metric, filters, nprobe);
+        }
 
         // Require HNSW index for search
         let Some(index) = &self.index else {
@@ -650,6 +749,109 @@ impl SegmentData {
         // Filter couldn't be evaluated by index, return empty
         // (In production, this would fall back to post-filtering)
         Vec::new()
+    }
+
+    fn ivf_search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: DistanceMetric,
+        filters: Option<&AttrValue>,
+        nprobe: usize,
+    ) -> Vec<ScoredResult> {
+        let Some(ivf) = &self.ivf_index else {
+            return Vec::new();
+        };
+
+        let top_k = top_k.min(self.vectors.len());
+        if top_k == 0 || query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut allowed = None;
+        if let Some(filter_value) = filters {
+            if let Some(filter_index) = &self.filters {
+                allowed = filter_index.evaluate(filter_value);
+                if let Some(bitmap) = &allowed {
+                    if bitmap.is_empty() {
+                        return Vec::new();
+                    }
+                }
+            } else {
+                return Vec::new();
+            }
+        }
+
+        let query_norm = if metric == DistanceMetric::Cosine {
+            crate::simd::l2_norm_f32(query)
+        } else {
+            0.0
+        };
+
+        let mut centroid_scores: Vec<(usize, f32)> = Vec::with_capacity(ivf.k);
+        for c in 0..ivf.k {
+            let dist = distance_with_norms(
+                query,
+                ivf.centroid(c),
+                query_norm,
+                ivf.centroid_norm(c),
+                metric,
+            );
+            centroid_scores.push((c, dist));
+        }
+        centroid_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        let mut nprobe = if nprobe == 0 { ivf.nprobe_default } else { nprobe };
+        nprobe = nprobe.clamp(1, ivf.k);
+        centroid_scores.truncate(nprobe);
+
+        let mut heap: BinaryHeap<(OrderedFloat<f32>, usize)> = BinaryHeap::new();
+        for (c, centroid_dist) in centroid_scores {
+            if metric == DistanceMetric::Euclidean && heap.len() >= top_k {
+                let worst = heap.peek().map(|v| v.0.into_inner()).unwrap_or(f32::INFINITY);
+                let worst_l2 = worst.sqrt();
+                let centroid_l2 = centroid_dist.sqrt();
+                if centroid_l2 - ivf.radii[c] > worst_l2 {
+                    continue;
+                }
+            }
+
+            for &vid in &ivf.posting_lists[c] {
+                if let Some(bitmap) = &allowed {
+                    if !bitmap.contains(vid) {
+                        continue;
+                    }
+                }
+                let vid = vid as usize;
+                if vid >= self.vectors.len() {
+                    continue;
+                }
+                let dist = distance_with_norms(
+                    query,
+                    &self.vectors[vid],
+                    query_norm,
+                    self.norm(vid),
+                    metric,
+                );
+                if heap.len() < top_k {
+                    heap.push((OrderedFloat(dist), vid));
+                } else if let Some(mut worst) = heap.peek_mut() {
+                    if dist < worst.0.into_inner() {
+                        *worst = (OrderedFloat(dist), vid);
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(heap.len());
+        while let Some((dist, index)) = heap.pop() {
+            results.push(ScoredResult {
+                index,
+                dist: dist.into_inner(),
+            });
+        }
+        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        results
     }
 }
 
@@ -782,4 +984,78 @@ pub struct ManifestSegment {
     pub segment_key: String,
     pub doc_count: i64,
     pub dimensions: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn exact_top_k(
+        vectors: &[Vec<f32>],
+        norms: &[f32],
+        query: &[f32],
+        query_norm: f32,
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Vec<ScoredResult> {
+        let mut scored: Vec<ScoredResult> = vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| ScoredResult {
+                index: idx,
+                dist: distance_with_norms(query, v, query_norm, norms[idx], metric),
+            })
+            .collect();
+        scored.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        scored.truncate(k);
+        scored
+    }
+
+    #[test]
+    fn ivf_search_matches_exact_with_full_probe() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let dims = 8;
+        let count = 64;
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|_| (0..dims).map(|_| rng.gen_range(-1.0..1.0)).collect())
+            .collect();
+        let norms: Vec<f32> = vectors.iter().map(|v| compute_norm(v)).collect();
+        let ids: Vec<String> = (0..count).map(|i| format!("id{}", i)).collect();
+
+        let vector_refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        let k = 8;
+        let ivf = IVFIndex::build(
+            &vector_refs,
+            DistanceMetric::Cosine,
+            k,
+            k,
+            10,
+            42,
+        )
+        .expect("ivf build");
+
+        let seg = SegmentData {
+            ids,
+            vectors: vectors.clone(),
+            attributes: vec![None; count],
+            dimensions: dims,
+            index: None,
+            ivf_index: Some(ivf),
+            filters: None,
+            raw_data: None,
+            norms,
+            is_v2: false,
+        };
+
+        let query = vectors[0].clone();
+        let query_norm = crate::simd::l2_norm_f32(&query);
+        let exact = exact_top_k(&vectors, &seg.norms, &query, query_norm, 5, DistanceMetric::Cosine);
+        let results = seg.search(&query, 5, DistanceMetric::Cosine, None, 0, 0);
+
+        let exact_ids: Vec<usize> = exact.iter().map(|r| r.index).collect();
+        let result_ids: Vec<usize> = results.iter().map(|r| r.index).collect();
+        assert_eq!(exact_ids, result_ids);
+    }
 }

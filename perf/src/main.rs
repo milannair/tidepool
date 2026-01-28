@@ -423,6 +423,7 @@ async fn run_query(args: &Args, client: &Client) -> Result<QuerySummary> {
                     vector,
                     top_k: args.top_k,
                     ef_search: args.ef_search,
+                    nprobe: 0,
                     distance_metric: args.distance_metric.clone(),
                     include_vectors: args.include_vectors,
                     filters,

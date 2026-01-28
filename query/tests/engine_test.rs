@@ -50,6 +50,7 @@ async fn engine_query_with_filters() {
         vector: vec![1.0, 0.0],
         top_k: 1,
         ef_search: 0,
+        nprobe: 0,
         distance_metric: None,
         include_vectors: false,
         filters: Some(tag_attr("x")),
