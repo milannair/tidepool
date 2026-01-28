@@ -4,11 +4,12 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hex::encode as hex_encode;
 use roaring::RoaringBitmap;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
+use crate::attributes::AttrValue;
 use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
 use crate::storage::{segment_index_path, segment_path, Store, StorageError};
@@ -18,10 +19,19 @@ use crate::vector::{distance, DistanceMetric};
 pub struct SegmentData {
     pub ids: Vec<String>,
     pub vectors: Vec<Vec<f32>>,
-    pub attributes: Vec<Option<Value>>,
+    pub attributes: Vec<Option<AttrValue>>,
     pub dimensions: usize,
     pub index: Option<HnswIndex>,
     pub filters: Option<FilterIndex>,
+}
+
+/// Internal struct for storing segment attributes.
+/// Attributes are stored as JSON bytes to avoid recursive type issues with rkyv.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+struct SegmentAttr {
+    id: String,
+    /// JSON-serialized attributes (or empty vec if None)
+    attributes_json: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,13 +112,6 @@ impl<S: Store> Writer<S> {
         buf.write_u32::<LittleEndian>(dimensions as u32)
             .map_err(|e| StorageError::Other(format!("write dimensions: {}", e)))?;
 
-        #[derive(Serialize)]
-        struct Attr<'a> {
-            id: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            attributes: &'a Option<Value>,
-        }
-
         let mut attr_data = Vec::with_capacity(docs.len());
 
         for doc in docs {
@@ -116,17 +119,23 @@ impl<S: Store> Writer<S> {
                 buf.write_f32::<LittleEndian>(*v)
                     .map_err(|e| StorageError::Other(format!("write vector: {}", e)))?;
             }
-            attr_data.push(Attr {
-                id: &doc.id,
-                attributes: &doc.attributes,
+            let attributes_json = match &doc.attributes {
+                Some(attrs) => serde_json::to_vec(attrs)
+                    .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?,
+                None => Vec::new(),
+            };
+            attr_data.push(SegmentAttr {
+                id: doc.id.clone(),
+                attributes_json,
             });
         }
 
-        let attr_json = serde_json::to_vec(&attr_data)
+        let attr_bytes = rkyv::to_bytes::<_, 256>(&attr_data)
             .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?;
-        buf.write_u32::<LittleEndian>(attr_json.len() as u32)
+        let attr_bytes = attr_bytes.as_ref();
+        buf.write_u32::<LittleEndian>(attr_bytes.len() as u32)
             .map_err(|e| StorageError::Other(format!("write attr length: {}", e)))?;
-        buf.extend_from_slice(&attr_json);
+        buf.extend_from_slice(&attr_bytes);
 
         let mut hnsw = HnswIndex::new(
             self.opts.hnsw_m,
@@ -246,20 +255,15 @@ impl<S: Store> Reader<S> {
         if attr_len == 0 {
             return Err(StorageError::Other("invalid attribute length".to_string()));
         }
-        let mut attr_json = vec![0u8; attr_len];
+        let mut attr_bytes = vec![0u8; attr_len];
         cursor
-            .read_exact(&mut attr_json)
+            .read_exact(&mut attr_bytes)
             .map_err(|e| StorageError::Other(format!("read attributes: {}", e)))?;
-
-        #[derive(Deserialize)]
-        struct Attr {
-            id: String,
-            #[serde(default)]
-            attributes: Option<Value>,
-        }
-
-        let attr_data: Vec<Attr> = serde_json::from_slice(&attr_json)
-            .map_err(|e| StorageError::Other(format!("parse attributes: {}", e)))?;
+        // SAFETY: We trust our own serialized data format
+        let archived = unsafe { rkyv::archived_root::<Vec<SegmentAttr>>(&attr_bytes) };
+        let attr_data: Vec<SegmentAttr> = archived
+            .deserialize(&mut rkyv::Infallible)
+            .map_err(|e| StorageError::Other(format!("deserialize attributes: {}", e)))?;
         if attr_data.len() != num_vectors {
             return Err(StorageError::Other(format!(
                 "attribute count mismatch: got {} want {}",
@@ -272,7 +276,13 @@ impl<S: Store> Reader<S> {
         let mut attrs = Vec::with_capacity(num_vectors);
         for attr in attr_data {
             ids.push(attr.id);
-            attrs.push(attr.attributes);
+            let attr_value = if attr.attributes_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_slice(&attr.attributes_json)
+                    .map_err(|e| StorageError::Other(format!("deserialize attributes: {}", e)))?)
+            };
+            attrs.push(attr_value);
         }
 
         let mut seg = SegmentData {
@@ -342,7 +352,7 @@ impl SegmentData {
         query: &[f32],
         top_k: usize,
         metric: DistanceMetric,
-        filters: Option<&Value>,
+        filters: Option<&AttrValue>,
         ef_search: usize,
     ) -> Vec<ScoredResult> {
         let top_k = if top_k == 0 { self.vectors.len() } else { top_k };
@@ -381,7 +391,7 @@ impl SegmentData {
         query: &[f32],
         top_k: usize,
         metric: DistanceMetric,
-        filters: Option<&Value>,
+        filters: Option<&AttrValue>,
         allowed: Option<&RoaringBitmap>,
     ) -> Vec<ScoredResult> {
         let mut results = Vec::new();
@@ -425,12 +435,12 @@ pub struct FilterIndex {
     string_filters: std::collections::HashMap<String, std::collections::HashMap<String, RoaringBitmap>>,
 }
 
-fn build_filter_index(attributes: &[Option<Value>]) -> Option<FilterIndex> {
+fn build_filter_index(attributes: &[Option<AttrValue>]) -> Option<FilterIndex> {
     let mut string_filters: std::collections::HashMap<_, std::collections::HashMap<_, RoaringBitmap>> =
         std::collections::HashMap::new();
 
     for (doc_id, attrs) in attributes.iter().enumerate() {
-        let Some(Value::Object(map)) = attrs else { continue };
+        let Some(AttrValue::Object(map)) = attrs else { continue };
         for (key, value) in map {
             let Some(value_key) = filter_value_key(value) else { continue };
             let entry = string_filters.entry(key.clone()).or_default();
@@ -447,8 +457,8 @@ fn build_filter_index(attributes: &[Option<Value>]) -> Option<FilterIndex> {
 }
 
 impl FilterIndex {
-    pub fn evaluate(&self, filters: &Value) -> Option<RoaringBitmap> {
-        let Value::Object(map) = filters else { return None };
+    pub fn evaluate(&self, filters: &AttrValue) -> Option<RoaringBitmap> {
+        let AttrValue::Object(map) = filters else { return None };
         if map.is_empty() {
             return None;
         }
@@ -460,7 +470,7 @@ impl FilterIndex {
             let mut matched = false;
 
             match value {
-                Value::Array(items) => {
+                AttrValue::Array(items) => {
                     if items.is_empty() {
                         return Some(RoaringBitmap::new());
                     }
@@ -500,23 +510,23 @@ impl FilterIndex {
     }
 }
 
-fn filter_value_key(value: &Value) -> Option<String> {
+fn filter_value_key(value: &AttrValue) -> Option<String> {
     match value {
-        Value::String(s) => Some(format!("s:{}", s)),
-        Value::Bool(b) => Some(format!("b:{}", if *b { 1 } else { 0 })),
-        Value::Number(num) => Some(format!("n:{}", num)),
+        AttrValue::String(s) => Some(format!("s:{}", s)),
+        AttrValue::Bool(b) => Some(format!("b:{}", if *b { 1 } else { 0 })),
+        AttrValue::Number(num) => Some(format!("n:{}", num)),
         _ => None,
     }
 }
 
-fn matches_filters(attrs: Option<&Value>, filters: &Value) -> bool {
-    let Some(Value::Object(attr_map)) = attrs else { return false };
-    let Value::Object(filter_map) = filters else { return false };
+fn matches_filters(attrs: Option<&AttrValue>, filters: &AttrValue) -> bool {
+    let Some(AttrValue::Object(attr_map)) = attrs else { return false };
+    let AttrValue::Object(filter_map) = filters else { return false };
 
     for (key, expected) in filter_map {
         let Some(actual) = attr_map.get(key) else { return false };
         match expected {
-            Value::Array(items) => {
+            AttrValue::Array(items) => {
                 if !items.iter().any(|item| item == actual) {
                     return false;
                 }

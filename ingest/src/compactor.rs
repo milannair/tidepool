@@ -9,7 +9,7 @@ use tidepool_common::document::Document;
 use tidepool_common::manifest::{Manager, Manifest};
 use tidepool_common::segment::{Reader, Writer, WriterOptions};
 use tidepool_common::storage::{segment_index_path, Store, StorageError};
-use tidepool_common::wal::{Entry, Reader as WalReader};
+use tidepool_common::wal::{DeserializedEntry, Reader as WalReader};
 
 #[derive(Clone)]
 pub struct Compactor<S: Store + Clone> {
@@ -231,7 +231,7 @@ pub struct Status {
     pub dimensions: usize,
 }
 
-fn apply_entry(doc_map: &mut HashMap<String, Document>, deleted: &mut HashSet<String>, entry: &Entry) {
+fn apply_entry(doc_map: &mut HashMap<String, Document>, deleted: &mut HashSet<String>, entry: &DeserializedEntry) {
     match entry.op.as_str() {
         "upsert" => {
             if let Some(doc) = &entry.doc {

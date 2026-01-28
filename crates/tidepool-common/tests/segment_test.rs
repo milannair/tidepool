@@ -1,8 +1,15 @@
-use serde_json::json;
+use std::collections::BTreeMap;
 
+use tidepool_common::attributes::AttrValue;
 use tidepool_common::document::Document;
 use tidepool_common::segment::{Reader, Writer};
 use tidepool_common::storage::InMemoryStore;
+
+fn tag_attr(value: &str) -> AttrValue {
+    let mut map = BTreeMap::new();
+    map.insert("tag".to_string(), AttrValue::String(value.to_string()));
+    AttrValue::Object(map)
+}
 
 #[tokio::test]
 async fn segment_roundtrip() {
@@ -14,12 +21,12 @@ async fn segment_roundtrip() {
         Document {
             id: "a".to_string(),
             vector: vec![1.0, 2.0],
-            attributes: Some(json!({"tag": "x"})),
+            attributes: Some(tag_attr("x")),
         },
         Document {
             id: "b".to_string(),
             vector: vec![3.0, 4.0],
-            attributes: Some(json!({"tag": "y"})),
+            attributes: Some(tag_attr("y")),
         },
     ];
 
