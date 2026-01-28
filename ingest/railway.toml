@@ -4,11 +4,10 @@
 builder = "dockerfile"
 dockerfilePath = "ingest/Dockerfile"
 watchPatterns = [
-  "ingest/cmd/ingest/**",
-  "ingest/internal/**",
-  "internal/**",
-  "go.mod",
-  "go.sum",
+  "ingest/src/**",
+  "crates/**",
+  "Cargo.toml",
+  "Cargo.lock",
   "ingest/Dockerfile"
 ]
 

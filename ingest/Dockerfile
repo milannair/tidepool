@@ -1,37 +1,26 @@
-FROM golang:1.23-alpine AS builder
-
-# Install git for go mod download (some deps may need it)
-RUN apk add --no-cache git ca-certificates
+FROM rust:1.93-slim AS builder
 
 WORKDIR /build
 
-# Copy go mod files first for better cache
-COPY go.mod go.sum* ./
-RUN go mod download
+# Cache dependencies
+COPY Cargo.toml Cargo.lock* ./
+COPY crates/tidepool-common/Cargo.toml crates/tidepool-common/Cargo.toml
+COPY query/Cargo.toml query/Cargo.toml
+COPY ingest/Cargo.toml ingest/Cargo.toml
 
-# Copy source code
+# Copy source
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-w -s" \
-    -o tidepool-ingest \
-    ./ingest/cmd/ingest
+# Build ingest binary
+RUN cargo build --release -p tidepool-ingest
 
-# Final stage - distroless for minimal attack surface
-FROM gcr.io/distroless/static:nonroot
+FROM debian:trixie-slim
 
-# Copy the binary
-COPY --from=builder /build/tidepool-ingest /tidepool-ingest
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Copy CA certificates for HTTPS
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /build/target/release/tidepool-ingest /tidepool-ingest
 
-# Create data directory
 WORKDIR /
-
-# Run as non-root user
-USER nonroot:nonroot
 
 EXPOSE 8080
 
