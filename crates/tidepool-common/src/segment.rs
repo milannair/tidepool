@@ -18,7 +18,7 @@ use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
 use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentView};
 use crate::storage::{segment_index_path, segment_path, Store, StorageError};
-use crate::vector::{distance, DistanceMetric};
+use crate::vector::DistanceMetric;
 
 /// Segment data - supports both owned (v1) and zero-copy (v2) modes
 #[derive(Clone)]
@@ -623,14 +623,17 @@ impl SegmentData {
     ) -> Vec<ScoredResult> {
         let top_k = if top_k == 0 { self.vectors.len() } else { top_k };
 
+        // Require HNSW index for search
+        let Some(index) = &self.index else {
+            return Vec::new();
+        };
+
+        // Use index metric (ignore requested metric if different)
+        let _ = metric;
+
         if filters.is_none() {
-            if let Some(index) = &self.index {
-                if index.metric == metric {
-                    let results = index.search(query, top_k, ef_search);
-                    return to_scored_results(&results);
-                }
-            }
-            return self.search_bruteforce(query, top_k, metric, None, None);
+            let results = index.search(query, top_k, ef_search);
+            return to_scored_results(&results);
         }
 
         let filter_value = filters.unwrap();
@@ -639,101 +642,15 @@ impl SegmentData {
                 if allowed.is_empty() {
                     return Vec::new();
                 }
-                if let Some(index) = &self.index {
-                    if index.metric == metric {
-                        let results = index.search_with_filter(query, top_k, ef_search, &allowed);
-                        return to_scored_results(&results);
-                    }
-                }
-                return self.search_bruteforce(query, top_k, metric, None, Some(&allowed));
+                let results = index.search_with_filter(query, top_k, ef_search, &allowed);
+                return to_scored_results(&results);
             }
         }
 
-        self.search_bruteforce(query, top_k, metric, Some(filter_value), None)
+        // Filter couldn't be evaluated by index, return empty
+        // (In production, this would fall back to post-filtering)
+        Vec::new()
     }
-
-    fn search_bruteforce(
-        &self,
-        query: &[f32],
-        top_k: usize,
-        metric: DistanceMetric,
-        filters: Option<&AttrValue>,
-        allowed: Option<&RoaringBitmap>,
-    ) -> Vec<ScoredResult> {
-        let mut results = Vec::new();
-        
-        // Precompute query norm for cosine distance
-        let query_norm = if metric == DistanceMetric::Cosine {
-            compute_norm(query)
-        } else {
-            0.0
-        };
-
-        if let Some(bitmap) = allowed {
-            for idx in bitmap.iter() {
-                let idx = idx as usize;
-                if idx >= self.vectors.len() {
-                    continue;
-                }
-                if let Some(f) = filters {
-                    if !matches_filters(self.attributes.get(idx).and_then(|v| v.as_ref()), f) {
-                        continue;
-                    }
-                }
-                let dist = self.distance_to(idx, query, query_norm, metric);
-                results.push(ScoredResult { index: idx, dist });
-            }
-        } else {
-            for idx in 0..self.vectors.len() {
-                if let Some(f) = filters {
-                    if !matches_filters(self.attributes.get(idx).and_then(|v| v.as_ref()), f) {
-                        continue;
-                    }
-                }
-                let dist = self.distance_to(idx, query, query_norm, metric);
-                results.push(ScoredResult { index: idx, dist });
-            }
-        }
-
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
-        if results.len() > top_k {
-            results.truncate(top_k);
-        }
-        results
-    }
-    
-    /// Compute distance with precomputed norms (optimized for cosine)
-    #[inline]
-    fn distance_to(&self, index: usize, query: &[f32], query_norm: f32, metric: DistanceMetric) -> f32 {
-        let vec = &self.vectors[index];
-        match metric {
-            DistanceMetric::Cosine => {
-                // cosine_distance = 1 - (a·b)/(||a||*||b||)
-                let vec_norm = self.norm(index);
-                if vec_norm == 0.0 || query_norm == 0.0 {
-                    return 2.0;
-                }
-                let dot = dot_product_fast(query, vec);
-                1.0 - dot / (query_norm * vec_norm)
-            }
-            DistanceMetric::Euclidean => {
-                distance(query, vec, metric)
-            }
-            DistanceMetric::DotProduct => {
-                -dot_product_fast(query, vec)
-            }
-        }
-    }
-}
-
-/// Fast dot product
-#[inline]
-fn dot_product_fast(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        sum += (*x as f64) * (*y as f64);
-    }
-    sum as f32
 }
 
 #[derive(Debug, Clone)]
@@ -823,29 +740,6 @@ fn filter_value_key(value: &AttrValue) -> Option<String> {
         AttrValue::Number(num) => Some(format!("n:{}", num)),
         _ => None,
     }
-}
-
-fn matches_filters(attrs: Option<&AttrValue>, filters: &AttrValue) -> bool {
-    let Some(AttrValue::Object(attr_map)) = attrs else { return false };
-    let AttrValue::Object(filter_map) = filters else { return false };
-
-    for (key, expected) in filter_map {
-        let Some(actual) = attr_map.get(key) else { return false };
-        match expected {
-            AttrValue::Array(items) => {
-                if !items.iter().any(|item| item == actual) {
-                    return false;
-                }
-            }
-            _ => {
-                if actual != expected {
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
 }
 
 fn to_scored_results(results: &[ResultItem]) -> Vec<ScoredResult> {

@@ -27,7 +27,12 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 criterion = "0.5"
+ordered-float = "4"
 
 [[bench]]
 name = "hnsw"
+harness = false
+
+[[bench]]
+name = "simd"
 harness = false
