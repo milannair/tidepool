@@ -349,6 +349,62 @@ impl<S: Store> Reader<S> {
         }
         Ok(SegmentBytes::Owned(data))
     }
+
+    /// Remove cached files for segments not in the valid set.
+    /// Call this after loading a new manifest to clean up stale cache entries.
+    /// Returns the number of files removed.
+    pub async fn cleanup_cache(&self, valid_segment_keys: &[String]) -> usize {
+        let Some(dir) = &self.cache_dir else { return 0 };
+
+        // Build set of valid cache file prefixes (hash of segment key)
+        let valid_prefixes: std::collections::HashSet<String> = valid_segment_keys
+            .iter()
+            .map(|key| cache_key_prefix(key))
+            .collect();
+
+        // Scan cache directory and remove stale files
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return 0,
+        };
+
+        let mut removed = 0usize;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Only process our cache files (.tpvs, .hnsw)
+            if !filename.ends_with(".tpvs") && !filename.ends_with(".hnsw") {
+                continue;
+            }
+
+            // Extract the hash prefix (first 16 chars before the extension)
+            let prefix = filename.split('.').next().unwrap_or("");
+            if prefix.len() != 16 {
+                continue;
+            }
+
+            // If prefix not in valid set, remove the file
+            if !valid_prefixes.contains(prefix) {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        removed
+    }
+}
+
+/// Get just the hash prefix for a cache key (for comparison during cleanup)
+fn cache_key_prefix(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let hash = hasher.finalize();
+    let hex = hex_encode(hash);
+    hex[..16].to_string()
 }
 
 enum SegmentBytes {

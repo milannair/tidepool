@@ -167,6 +167,20 @@ impl<S: Store + Clone + 'static> Engine<S> {
 
     async fn refresh_state(&self) {
         let changed = self.load_manifest().await.unwrap_or(false);
+        if changed {
+            // Clean up stale cache files when manifest changes
+            if let Some(manifest) = self.current_manifest.read().await.clone() {
+                let valid_keys: Vec<String> = manifest
+                    .segments
+                    .iter()
+                    .map(|s| s.segment_key.clone())
+                    .collect();
+                let removed = self.segment_reader.cleanup_cache(&valid_keys).await;
+                if removed > 0 {
+                    info!("Cache cleanup: removed {} stale files", removed);
+                }
+            }
+        }
         let _ = self.ensure_segments_loaded().await;
         if changed || self.id_versions.read().await.is_empty() {
             let _ = self.refresh_tombstones().await;
