@@ -30,13 +30,14 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables.
+// Supports both Railway bucket names and standard AWS names.
 func Load() *Config {
 	cfg := &Config{
 		AWSAccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
 		AWSSecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		AWSEndpointURL:     os.Getenv("AWS_ENDPOINT_URL"),
-		AWSRegion:          os.Getenv("AWS_REGION"),
-		BucketName:         os.Getenv("BUCKET_NAME"),
+		AWSRegion:          getEnvWithFallback("AWS_DEFAULT_REGION", "AWS_REGION"),
+		BucketName:         getEnvWithFallback("AWS_S3_BUCKET_NAME", "BUCKET_NAME"),
 		CacheDir:           getEnvOrDefault("CACHE_DIR", "/data"),
 		Namespace:          getEnvOrDefault("NAMESPACE", "default"),
 		CompactionInterval: parseDuration(os.Getenv("COMPACTION_INTERVAL"), 5*time.Minute),
@@ -63,10 +64,10 @@ func (c *Config) Validate() error {
 		return &ConfigError{Field: "AWS_ENDPOINT_URL"}
 	}
 	if c.AWSRegion == "" {
-		return &ConfigError{Field: "AWS_REGION"}
+		return &ConfigError{Field: "AWS_DEFAULT_REGION or AWS_REGION"}
 	}
 	if c.BucketName == "" {
-		return &ConfigError{Field: "BUCKET_NAME"}
+		return &ConfigError{Field: "AWS_S3_BUCKET_NAME or BUCKET_NAME"}
 	}
 	return nil
 }
@@ -85,6 +86,14 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+// getEnvWithFallback tries primary key first, then fallback key.
+func getEnvWithFallback(primary, fallback string) string {
+	if v := os.Getenv(primary); v != "" {
+		return v
+	}
+	return os.Getenv(fallback)
 }
 
 func parseDuration(s string, defaultValue time.Duration) time.Duration {
