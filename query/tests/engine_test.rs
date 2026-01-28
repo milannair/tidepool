@@ -44,7 +44,7 @@ async fn engine_query_with_filters() {
     manager.save(&manifest).await.unwrap();
 
     let engine = Engine::new(store.clone(), namespace.to_string(), None);
-    engine.load_manifest().await.unwrap();
+    let _ = engine.load_manifest().await.unwrap();
 
     let req = QueryRequest {
         vector: vec![1.0, 0.0],

@@ -325,9 +325,8 @@ impl HnswIndex {
         results.push((OrderedFloat(entry_dist), entry));
         visited[entry] = true;
 
-        while let Some(Reverse((OrderedFloat(_), current))) = candidates.pop() {
+        while let Some(Reverse((OrderedFloat(current_dist), current))) = candidates.pop() {
             let worst = results.peek().map(|(dist, _)| dist.0).unwrap_or(f32::MAX);
-            let current_dist = distance(query, &self.nodes[current].vector, self.metric);
             if current_dist > worst {
                 break;
             }
@@ -385,9 +384,8 @@ impl HnswIndex {
         results.push((OrderedFloat(entry_dist), entry));
         visited[entry] = true;
 
-        while let Some(Reverse((OrderedFloat(_), current))) = candidates.pop() {
+        while let Some(Reverse((OrderedFloat(current_dist), current))) = candidates.pop() {
             let worst = results.peek().map(|(dist, _)| dist.0).unwrap_or(f32::MAX);
-            let current_dist = distance(query, &self.nodes[current].vector, self.metric);
             if current_dist > worst {
                 break;
             }

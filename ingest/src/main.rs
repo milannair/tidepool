@@ -19,10 +19,12 @@ use tidepool_common::wal::Writer as WalWriter;
 
 mod compactor;
 use compactor::Compactor;
+mod wal_buffer;
+use wal_buffer::BufferedWalWriter;
 
 #[derive(Clone)]
 struct AppState {
-    wal_writer: Arc<WalWriter<S3Store>>,
+    wal_writer: Arc<BufferedWalWriter<S3Store>>,
     compactor: Arc<Compactor<S3Store>>,
     namespace: String,
 }
@@ -51,7 +53,11 @@ async fn main() {
         }
     };
 
-    let wal_writer = WalWriter::new(storage.clone(), cfg.namespace.clone());
+    let wal_writer = BufferedWalWriter::new(
+        WalWriter::new(storage.clone(), cfg.namespace.clone()),
+        cfg.wal_batch_max_entries,
+        cfg.wal_batch_flush_interval,
+    );
     let compactor = Compactor::new_with_options(
         storage,
         cfg.namespace.clone(),

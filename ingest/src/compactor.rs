@@ -7,17 +7,17 @@ use tracing::{info, warn};
 
 use tidepool_common::document::Document;
 use tidepool_common::manifest::{Manager, Manifest};
-use tidepool_common::segment::{Reader, Writer, WriterOptions};
-use tidepool_common::storage::{segment_index_path, Store, StorageError};
+use tidepool_common::segment::{Writer, WriterOptions};
+use tidepool_common::storage::{Store, StorageError};
+use tidepool_common::tombstone::Manager as TombstoneManager;
 use tidepool_common::wal::{DeserializedEntry, Reader as WalReader};
 
 #[derive(Clone)]
 pub struct Compactor<S: Store + Clone> {
-    storage: S,
-    namespace: String,
     wal_reader: WalReader<S>,
     segment_writer: Writer<S>,
     manifest_manager: Manager<S>,
+    tombstone_manager: TombstoneManager<S>,
     last_run: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
@@ -25,11 +25,10 @@ impl<S: Store + Clone> Compactor<S> {
     pub fn new_with_options(storage: S, namespace: impl Into<String>, opts: WriterOptions) -> Self {
         let namespace = namespace.into();
         Self {
-            storage: storage.clone(),
-            namespace: namespace.clone(),
             wal_reader: WalReader::new(storage.clone(), &namespace),
             segment_writer: Writer::new_with_options(storage.clone(), &namespace, opts),
-            manifest_manager: Manager::new(storage, &namespace),
+            manifest_manager: Manager::new(storage.clone(), &namespace),
+            tombstone_manager: TombstoneManager::new(storage, &namespace),
             last_run: Arc::new(RwLock::new(None)),
         }
     }
@@ -58,36 +57,10 @@ impl<S: Store + Clone> Compactor<S> {
         }
 
         let mut existing_segments = Vec::new();
+        let mut existing_dimensions = 0usize;
         if let Ok(manifest) = self.manifest_manager.load().await {
+            existing_dimensions = manifest.dimensions;
             existing_segments = manifest.segments;
-        }
-
-        let seg_reader = Reader::new(self.storage.clone(), &self.namespace, None);
-        for seg in &existing_segments {
-            let seg_data = match seg_reader.read_segment(&seg.segment_key).await {
-                Ok(data) => data,
-                Err(err) => {
-                    warn!("Warning: failed to read existing segment {}: {}", seg.id, err);
-                    continue;
-                }
-            };
-
-            for i in 0..seg_data.ids.len() {
-                let id = seg_data.ids[i].clone();
-                if deleted_ids.contains(&id) {
-                    continue;
-                }
-                if !doc_map.contains_key(&id) {
-                    doc_map.insert(
-                        id.clone(),
-                        Document {
-                            id,
-                            vector: seg_data.vectors[i].clone(),
-                            attributes: seg_data.attributes[i].clone(),
-                        },
-                    );
-                }
-            }
         }
 
         let mut docs: Vec<Document> = doc_map
@@ -95,20 +68,9 @@ impl<S: Store + Clone> Compactor<S> {
             .filter(|doc| !doc.vector.is_empty())
             .collect();
 
-        if docs.is_empty() {
-            info!("No vectors to compact");
-            let empty = Manifest::new(Vec::new());
-            self.manifest_manager
-                .save(&empty)
-                .await
-                .map_err(|err| format!("failed to save empty manifest: {}", err))?;
-            self.delete_wal_files(&wal_files).await;
-            return Ok(());
-        }
-
         docs.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let mut dims = 0usize;
+        let mut dims = existing_dimensions;
         for (i, doc) in docs.iter().enumerate() {
             if doc.vector.is_empty() {
                 return Err(format!("document {} has empty vector during compaction", i));
@@ -124,42 +86,59 @@ impl<S: Store + Clone> Compactor<S> {
             }
         }
 
-        info!("Compacting {} vectors", docs.len());
+        let mut segments = existing_segments.clone();
+        if !docs.is_empty() {
+            info!("Compacting {} vectors", docs.len());
 
-        let docs_ref: Vec<Document> = docs;
-        let seg = self
-            .segment_writer
-            .write_segment(&docs_ref)
+            let seg = self
+                .segment_writer
+                .write_segment(&docs)
+                .await
+                .map_err(|err| format!("failed to write segment: {}", err))?
+                .ok_or_else(|| "failed to create segment".to_string())?;
+
+            info!(
+                "Created segment {} with {} vectors ({} dimensions)",
+                seg.id, seg.doc_count, seg.dimensions
+            );
+
+            segments.push(tidepool_common::manifest::Segment {
+                id: seg.id.clone(),
+                segment_key: seg.segment_key.clone(),
+                doc_count: seg.doc_count,
+                dimensions: seg.dimensions,
+            });
+        } else {
+            info!("No vectors to compact, applying tombstones only");
+        }
+
+        let mut tombstones = self
+            .tombstone_manager
+            .load()
             .await
-            .map_err(|err| format!("failed to write segment: {}", err))?
-            .ok_or_else(|| "failed to create segment".to_string())?;
+            .unwrap_or_else(|_| HashSet::new());
 
-        info!(
-            "Created segment {} with {} vectors ({} dimensions)",
-            seg.id, seg.doc_count, seg.dimensions
-        );
+        for id in &deleted_ids {
+            tombstones.insert(id.clone());
+        }
+        for doc in &docs {
+            tombstones.remove(&doc.id);
+        }
 
-        let new_manifest = Manifest::new(vec![tidepool_common::manifest::Segment {
-            id: seg.id.clone(),
-            segment_key: seg.segment_key.clone(),
-            doc_count: seg.doc_count,
-            dimensions: seg.dimensions,
-        }]);
+        let mut new_manifest = Manifest::new(segments);
+        if new_manifest.dimensions == 0 {
+            new_manifest.dimensions = dims;
+        }
 
         self.manifest_manager
             .save(&new_manifest)
             .await
             .map_err(|err| format!("failed to save manifest: {}", err))?;
 
-        for seg in &existing_segments {
-            if let Err(err) = self.storage.delete(&seg.segment_key).await {
-                warn!("Warning: failed to delete old segment {}: {}", seg.id, err);
-            }
-            let index_key = segment_index_path(&self.namespace, &seg.id);
-            if let Err(err) = self.storage.delete(&index_key).await {
-                warn!("Warning: failed to delete old segment index {}: {}", seg.id, err);
-            }
-        }
+        self.tombstone_manager
+            .save(&tombstones)
+            .await
+            .map_err(|err| format!("failed to save tombstones: {}", err))?;
 
         self.delete_wal_files(&wal_files).await;
 

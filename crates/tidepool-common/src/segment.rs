@@ -1,12 +1,15 @@
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hex::encode as hex_encode;
+use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::task;
 use tokio::fs;
 
 use crate::attributes::AttrValue;
@@ -213,7 +216,7 @@ impl<S: Store> Reader<S> {
 
     pub async fn read_segment(&self, segment_key: &str) -> Result<SegmentData, StorageError> {
         let data = self.get_segment_data(segment_key).await?;
-        let mut cursor = std::io::Cursor::new(data);
+        let mut cursor = std::io::Cursor::new(data.as_slice());
         let mut magic = [0u8; 4];
         cursor
             .read_exact(&mut magic)
@@ -298,7 +301,9 @@ impl<S: Store> Reader<S> {
             let index_key = segment_index_path(&self.namespace, &segment_id);
             if self.storage.exists(&index_key).await.unwrap_or(false) {
                 if let Ok(index_data) = self.get_index_data(&index_key).await {
-                    if let Ok(hnsw) = HnswIndex::load_binary(&index_data, &seg.vectors, self.hnsw_ef_search) {
+                    if let Ok(hnsw) =
+                        HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
+                    {
                         seg.index = Some(hnsw);
                     }
                 }
@@ -309,11 +314,14 @@ impl<S: Store> Reader<S> {
         Ok(seg)
     }
 
-    async fn get_segment_data(&self, segment_key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_segment_data(&self, segment_key: &str) -> Result<SegmentBytes, StorageError> {
         if let Some(dir) = &self.cache_dir {
             let cache_path = format!("{}/{}", dir, cache_key(segment_key, "tpvs"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
             if let Ok(data) = fs::read(&cache_path).await {
-                return Ok(data);
+                return Ok(SegmentBytes::Owned(data));
             }
         }
         let data = self.storage.get(segment_key).await?;
@@ -321,14 +329,17 @@ impl<S: Store> Reader<S> {
             let cache_path = format!("{}/{}", dir, cache_key(segment_key, "tpvs"));
             let _ = fs::write(cache_path, &data).await;
         }
-        Ok(data)
+        Ok(SegmentBytes::Owned(data))
     }
 
-    async fn get_index_data(&self, index_key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_index_data(&self, index_key: &str) -> Result<SegmentBytes, StorageError> {
         if let Some(dir) = &self.cache_dir {
             let cache_path = format!("{}/{}", dir, cache_key(index_key, "hnsw"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
             if let Ok(data) = fs::read(&cache_path).await {
-                return Ok(data);
+                return Ok(SegmentBytes::Owned(data));
             }
         }
         let data = self.storage.get(index_key).await?;
@@ -336,7 +347,21 @@ impl<S: Store> Reader<S> {
             let cache_path = format!("{}/{}", dir, cache_key(index_key, "hnsw"));
             let _ = fs::write(cache_path, &data).await;
         }
-        Ok(data)
+        Ok(SegmentBytes::Owned(data))
+    }
+}
+
+enum SegmentBytes {
+    Owned(Vec<u8>),
+    Mapped(Mmap),
+}
+
+impl SegmentBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            SegmentBytes::Owned(buf) => buf.as_slice(),
+            SegmentBytes::Mapped(mmap) => mmap,
+        }
     }
 }
 
@@ -563,6 +588,17 @@ fn cache_key(key: &str, ext: &str) -> String {
     let hash = hasher.finalize();
     let hex = hex_encode(hash);
     format!("{}.{}", &hex[..16], ext)
+}
+
+async fn map_cached_file(path: String) -> Option<Mmap> {
+    task::spawn_blocking(move || {
+        let file = File::open(&path).ok()?;
+        // SAFETY: the file is not mutated while mapped
+        unsafe { Mmap::map(&file).ok() }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

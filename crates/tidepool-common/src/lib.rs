@@ -5,5 +5,6 @@ pub mod index;
 pub mod manifest;
 pub mod segment;
 pub mod storage;
+pub mod tombstone;
 pub mod vector;
 pub mod wal;

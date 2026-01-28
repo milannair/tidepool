@@ -230,3 +230,7 @@ pub fn segment_path(namespace: &str, segment_id: &str) -> String {
 pub fn segment_index_path(namespace: &str, segment_id: &str) -> String {
     namespace_path(namespace, &format!("segments/{}.hnsw", segment_id))
 }
+
+pub fn tombstone_path(namespace: &str) -> String {
+    namespace_path(namespace, "tombstones/latest.rkyv")
+}
