@@ -6,15 +6,17 @@ This repo is a **two-service** Railway template:
 - **tidepool-ingest** (private, write + compaction)
 
 Railway templates for multiple services are created from a Railway project in
-the UI rather than fully defined in `railway.json`/`railway.toml`. citeturn2search2turn3search0
+the UI rather than fully defined in `railway.json`/`railway.toml`.
 
 ## One-Click Template Setup
 
 1. Create a Railway project from this GitHub repo.
 2. Add two services:
-   - `tidepool-query` → Config file `/query/railway.toml` (absolute path). citeturn2search1turn2search2
-   - `tidepool-ingest` → Config file `/ingest/railway.toml` (absolute path). citeturn2search1turn2search2
-3. For both services, set **Root Directory** to `/` (repo root). citeturn2search3
+   - `tidepool-query` → Config file `/query/railway.toml` (absolute path).
+   - `tidepool-ingest` → Config file `/ingest/railway.toml` (absolute path).
+3. For both services, set **Root Directory** to `/` (repo root).
+   - Ensure the **Builder** is set to Dockerfile. If Railpack is used, set the
+     env var `RAILWAY_DOCKERFILE_PATH` (already in each service config).
 4. Add Railway Object Storage (S3-compatible bucket).
 5. Attach the bucket env vars to both services:
    - `AWS_ACCESS_KEY_ID`
@@ -28,4 +30,7 @@ the UI rather than fully defined in `railway.json`/`railway.toml`. citetur
 ## Troubleshooting
 
 - If you see `stat /build/cmd/...: directory not found`, the service Root Directory
-  is not set to `/` and the build context doesn’t include the repo root. citeturn2search3
+  is not set to `/` and the build context doesn’t include the repo root.
+- If you see `no Go files in /app`, the service is using Railpack instead of the
+  Dockerfile builder. Switch the builder to Dockerfile or rely on the
+  `RAILWAY_DOCKERFILE_PATH` env var.

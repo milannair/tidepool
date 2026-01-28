@@ -12,6 +12,9 @@ watchPatterns = [
   "query/Dockerfile"
 ]
 
+[env]
+RAILWAY_DOCKERFILE_PATH = "/query/Dockerfile"
+
 [deploy]
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
