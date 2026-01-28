@@ -71,6 +71,8 @@ pub struct QueryRequest {
     #[serde(default)]
     pub ef_search: usize,
     #[serde(default)]
+    pub nprobe: usize,
+    #[serde(default)]
     pub distance_metric: Option<String>,
     #[serde(default)]
     pub include_vectors: bool,

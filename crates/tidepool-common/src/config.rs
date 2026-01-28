@@ -23,6 +23,12 @@ pub struct Config {
     pub hnsw_m: usize,
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
+    pub ivf_enabled: bool,
+    pub ivf_min_segment_size: usize,
+    pub ivf_nprobe_default: usize,
+    pub ivf_k_factor: f32,
+    pub ivf_min_k: usize,
+    pub ivf_max_k: usize,
     pub wal_batch_max_entries: usize,
     pub wal_batch_flush_interval: Duration,
 }
@@ -48,6 +54,12 @@ impl Config {
             hnsw_m: parse_usize("HNSW_M", 16),
             hnsw_ef_construction: parse_usize("HNSW_EF_CONSTRUCTION", 200),
             hnsw_ef_search: parse_usize("HNSW_EF_SEARCH", 100),
+            ivf_enabled: parse_bool("IVF_ENABLED", true),
+            ivf_min_segment_size: parse_usize("IVF_MIN_SEGMENT_SIZE", 10_000),
+            ivf_nprobe_default: parse_usize("IVF_NPROBE_DEFAULT", 10),
+            ivf_k_factor: parse_f32("IVF_K_FACTOR", 1.0),
+            ivf_min_k: parse_usize("IVF_MIN_K", 16),
+            ivf_max_k: parse_usize("IVF_MAX_K", 65_535),
             wal_batch_max_entries: parse_usize("WAL_BATCH_MAX_ENTRIES", 1),
             wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
         };
@@ -96,6 +108,24 @@ fn parse_duration_fallback(key: &str, default: Duration) -> Duration {
 fn parse_usize(key: &str, default: usize) -> usize {
     match env::var(key) {
         Ok(raw) if !raw.is_empty() => raw.parse::<usize>().unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn parse_f32(key: &str, default: f32) -> f32 {
+    match env::var(key) {
+        Ok(raw) if !raw.is_empty() => raw.parse::<f32>().unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn parse_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(raw) if !raw.is_empty() => match raw.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => true,
+            "0" | "false" | "no" | "n" | "off" => false,
+            _ => default,
+        },
         _ => default,
     }
 }

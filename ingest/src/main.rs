@@ -67,6 +67,13 @@ async fn main() {
             hnsw_ef_search: cfg.hnsw_ef_search,
             metric: tidepool_common::vector::DistanceMetric::Cosine,
             use_v2_format: true,
+            ivf_enabled: cfg.ivf_enabled,
+            ivf_min_segment_size: cfg.ivf_min_segment_size,
+            ivf_k_factor: cfg.ivf_k_factor,
+            ivf_min_k: cfg.ivf_min_k,
+            ivf_max_k: cfg.ivf_max_k,
+            ivf_nprobe_default: cfg.ivf_nprobe_default,
+            ..WriterOptions::default()
         },
     );
 

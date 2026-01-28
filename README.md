@@ -32,6 +32,7 @@ namespaces/{namespace}/
   segments/
     {segment_id}.tpvs    # Vector segments
     {segment_id}.hnsw    # HNSW index graph
+    {segment_id}.ivf     # IVF centroid index
   tombstones/
     latest.rkyv          # Deleted IDs
 ```
@@ -49,6 +50,7 @@ Query vectors by similarity.
   "vector": [0.1, 0.2, 0.3, ...],
   "top_k": 10,
   "ef_search": 100,
+  "nprobe": 10,
   "distance_metric": "cosine_distance",
   "include_vectors": false,
   "filters": {
@@ -167,8 +169,16 @@ Health check.
 | `HNSW_M` | No | `16` | HNSW max connections per node |
 | `HNSW_EF_CONSTRUCTION` | No | `200` | HNSW build-time beam width |
 | `HNSW_EF_SEARCH` | No | `100` | HNSW query-time beam width |
+| `IVF_ENABLED` | No | `true` | Enable IVF index build for large segments |
+| `IVF_MIN_SEGMENT_SIZE` | No | `10000` | Minimum vectors per segment to build IVF |
+| `IVF_NPROBE_DEFAULT` | No | `10` | Default nprobe used by IVF search |
+| `IVF_K_FACTOR` | No | `1.0` | IVF k scaling factor (k ≈ sqrt(n) * factor) |
+| `IVF_MIN_K` | No | `16` | IVF minimum cluster count |
+| `IVF_MAX_K` | No | `65535` | IVF maximum cluster count |
 | `WAL_BATCH_MAX_ENTRIES` | No | `1` | Max WAL entries per batch write (ingest) |
 | `WAL_BATCH_FLUSH_INTERVAL` | No | `0ms` | Max time to wait before flushing WAL batch |
+
+**IVF migration note:** Existing segments without `.ivf` continue to query via HNSW. Run compaction after enabling IVF to build new IVF indexes for large segments.
 
 ## Development
 

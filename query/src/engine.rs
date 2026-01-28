@@ -8,7 +8,7 @@ use tracing::info;
 use tidepool_common::document::{QueryRequest, QueryResponse, VectorResult};
 use tidepool_common::manifest::{Manifest, Manager};
 use tidepool_common::segment::{Reader, ReaderOptions, SegmentData};
-use tidepool_common::storage::Store;
+use tidepool_common::storage::{segment_index_path, segment_ivf_path, Store};
 use tidepool_common::tombstone::Manager as TombstoneManager;
 use tidepool_common::vector::DistanceMetric;
 
@@ -170,11 +170,12 @@ impl<S: Store + Clone + 'static> Engine<S> {
         if changed {
             // Clean up stale cache files when manifest changes
             if let Some(manifest) = self.current_manifest.read().await.clone() {
-                let valid_keys: Vec<String> = manifest
-                    .segments
-                    .iter()
-                    .map(|s| s.segment_key.clone())
-                    .collect();
+                let mut valid_keys: Vec<String> = Vec::new();
+                for seg in &manifest.segments {
+                    valid_keys.push(seg.segment_key.clone());
+                    valid_keys.push(segment_index_path(&self.namespace, &seg.id));
+                    valid_keys.push(segment_ivf_path(&self.namespace, &seg.id));
+                }
                 let removed = self.segment_reader.cleanup_cache(&valid_keys).await;
                 if removed > 0 {
                     info!("Cache cleanup: removed {} stale files", removed);
@@ -218,15 +219,17 @@ impl<S: Store + Clone + 'static> Engine<S> {
         let filters = req.filters.clone();
         let include_vectors = req.include_vectors;
         let ef_search = req.ef_search;
+        let nprobe = req.nprobe;
         let mut handles = Vec::new();
         for (seg_index, seg_meta) in manifest.segments.iter().enumerate() {
             let Some(seg_data) = segments.get(&seg_meta.id) else { continue };
             let seg_data = Arc::clone(seg_data);
             let query_vector = query_vector.clone();
             let filters = filters.clone();
+            let nprobe = nprobe;
             let handle = tokio::task::spawn_blocking(move || {
                 let max_k = seg_data.vectors.len().min(per_segment_k);
-                let results = seg_data.search(&query_vector, max_k, metric, filters.as_ref(), ef_search);
+                let results = seg_data.search(&query_vector, max_k, metric, filters.as_ref(), ef_search, nprobe);
                 let mut out = Vec::with_capacity(results.len());
                 for r in results {
                     let mut result = VectorResult {
