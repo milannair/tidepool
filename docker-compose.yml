@@ -42,6 +42,7 @@ services:
       BUCKET_NAME: tidepool
       CACHE_DIR: /data
       NAMESPACE: default
+      RUST_LOG: info
     volumes:
       - query-cache:/data
     depends_on:
@@ -62,6 +63,7 @@ services:
       BUCKET_NAME: tidepool
       NAMESPACE: default
       COMPACTION_INTERVAL: 1m
+      RUST_LOG: info
     depends_on:
       minio-init:
         condition: service_completed_successfully

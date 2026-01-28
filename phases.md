@@ -14,12 +14,12 @@
 
 ## Phase 2: Performance & Indexing
 
-- [ ] HNSW approximate nearest neighbor index
-- [ ] Incremental compaction (avoid full rebuilds)
-- [ ] Segment caching optimizations
-- [ ] Parallel query execution
-- [ ] Batch upsert optimizations
-- [ ] Memory-mapped segment access
+- [x] HNSW approximate nearest neighbor index
+- [x] Incremental compaction (avoid full rebuilds)
+- [x] Segment caching optimizations
+- [x] Parallel query execution
+- [x] Batch upsert optimizations
+- [x] Memory-mapped segment access
 
 ## Phase 3: Scalability
 

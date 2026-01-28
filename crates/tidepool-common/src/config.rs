@@ -23,6 +23,8 @@ pub struct Config {
     pub hnsw_m: usize,
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
+    pub wal_batch_max_entries: usize,
+    pub wal_batch_flush_interval: Duration,
 }
 
 impl Config {
@@ -46,6 +48,8 @@ impl Config {
             hnsw_m: parse_usize("HNSW_M", 16),
             hnsw_ef_construction: parse_usize("HNSW_EF_CONSTRUCTION", 200),
             hnsw_ef_search: parse_usize("HNSW_EF_SEARCH", 100),
+            wal_batch_max_entries: parse_usize("WAL_BATCH_MAX_ENTRIES", 1),
+            wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
         };
 
         cfg.validate()?;

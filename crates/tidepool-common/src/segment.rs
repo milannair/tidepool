@@ -1,12 +1,15 @@
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hex::encode as hex_encode;
+use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::task;
 use tokio::fs;
 
 use crate::attributes::AttrValue;
@@ -213,7 +216,7 @@ impl<S: Store> Reader<S> {
 
     pub async fn read_segment(&self, segment_key: &str) -> Result<SegmentData, StorageError> {
         let data = self.get_segment_data(segment_key).await?;
-        let mut cursor = std::io::Cursor::new(data);
+        let mut cursor = std::io::Cursor::new(data.as_slice());
         let mut magic = [0u8; 4];
         cursor
             .read_exact(&mut magic)
@@ -298,7 +301,9 @@ impl<S: Store> Reader<S> {
             let index_key = segment_index_path(&self.namespace, &segment_id);
             if self.storage.exists(&index_key).await.unwrap_or(false) {
                 if let Ok(index_data) = self.get_index_data(&index_key).await {
-                    if let Ok(hnsw) = HnswIndex::load_binary(&index_data, &seg.vectors, self.hnsw_ef_search) {
+                    if let Ok(hnsw) =
+                        HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
+                    {
                         seg.index = Some(hnsw);
                     }
                 }
@@ -309,11 +314,14 @@ impl<S: Store> Reader<S> {
         Ok(seg)
     }
 
-    async fn get_segment_data(&self, segment_key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_segment_data(&self, segment_key: &str) -> Result<SegmentBytes, StorageError> {
         if let Some(dir) = &self.cache_dir {
             let cache_path = format!("{}/{}", dir, cache_key(segment_key, "tpvs"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
             if let Ok(data) = fs::read(&cache_path).await {
-                return Ok(data);
+                return Ok(SegmentBytes::Owned(data));
             }
         }
         let data = self.storage.get(segment_key).await?;
@@ -321,14 +329,17 @@ impl<S: Store> Reader<S> {
             let cache_path = format!("{}/{}", dir, cache_key(segment_key, "tpvs"));
             let _ = fs::write(cache_path, &data).await;
         }
-        Ok(data)
+        Ok(SegmentBytes::Owned(data))
     }
 
-    async fn get_index_data(&self, index_key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_index_data(&self, index_key: &str) -> Result<SegmentBytes, StorageError> {
         if let Some(dir) = &self.cache_dir {
             let cache_path = format!("{}/{}", dir, cache_key(index_key, "hnsw"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
             if let Ok(data) = fs::read(&cache_path).await {
-                return Ok(data);
+                return Ok(SegmentBytes::Owned(data));
             }
         }
         let data = self.storage.get(index_key).await?;
@@ -336,7 +347,77 @@ impl<S: Store> Reader<S> {
             let cache_path = format!("{}/{}", dir, cache_key(index_key, "hnsw"));
             let _ = fs::write(cache_path, &data).await;
         }
-        Ok(data)
+        Ok(SegmentBytes::Owned(data))
+    }
+
+    /// Remove cached files for segments not in the valid set.
+    /// Call this after loading a new manifest to clean up stale cache entries.
+    /// Returns the number of files removed.
+    pub async fn cleanup_cache(&self, valid_segment_keys: &[String]) -> usize {
+        let Some(dir) = &self.cache_dir else { return 0 };
+
+        // Build set of valid cache file prefixes (hash of segment key)
+        let valid_prefixes: std::collections::HashSet<String> = valid_segment_keys
+            .iter()
+            .map(|key| cache_key_prefix(key))
+            .collect();
+
+        // Scan cache directory and remove stale files
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return 0,
+        };
+
+        let mut removed = 0usize;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Only process our cache files (.tpvs, .hnsw)
+            if !filename.ends_with(".tpvs") && !filename.ends_with(".hnsw") {
+                continue;
+            }
+
+            // Extract the hash prefix (first 16 chars before the extension)
+            let prefix = filename.split('.').next().unwrap_or("");
+            if prefix.len() != 16 {
+                continue;
+            }
+
+            // If prefix not in valid set, remove the file
+            if !valid_prefixes.contains(prefix) {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        removed
+    }
+}
+
+/// Get just the hash prefix for a cache key (for comparison during cleanup)
+fn cache_key_prefix(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let hash = hasher.finalize();
+    let hex = hex_encode(hash);
+    hex[..16].to_string()
+}
+
+enum SegmentBytes {
+    Owned(Vec<u8>),
+    Mapped(Mmap),
+}
+
+impl SegmentBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            SegmentBytes::Owned(buf) => buf.as_slice(),
+            SegmentBytes::Mapped(mmap) => mmap,
+        }
     }
 }
 
@@ -563,6 +644,17 @@ fn cache_key(key: &str, ext: &str) -> String {
     let hash = hasher.finalize();
     let hex = hex_encode(hash);
     format!("{}.{}", &hex[..16], ext)
+}
+
+async fn map_cached_file(path: String) -> Option<Mmap> {
+    task::spawn_blocking(move || {
+        let file = File::open(&path).ok()?;
+        // SAFETY: the file is not mutated while mapped
+        unsafe { Mmap::map(&file).ok() }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -22,7 +22,12 @@ sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 byteorder = "1"
+memmap2 = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[bench]]
+name = "hnsw"
+harness = false

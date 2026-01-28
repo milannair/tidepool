@@ -56,28 +56,17 @@ impl<S: Store> Writer<S> {
             return Ok(None);
         }
 
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        let wal_id = Uuid::new_v4().to_string();
-        let wal_path = wal_path(&self.namespace, &date, &wal_id);
-
-        let mut buf = Vec::new();
-        for doc in docs {
-            let entry = Entry {
+        let entries: Vec<Entry> = docs
+            .into_iter()
+            .map(|doc| Entry {
                 ts: now_ts_nanos(),
                 op: "upsert".to_string(),
                 doc: Some(RkyvDocument::from(&doc)),
                 delete_ids: Vec::new(),
-            };
-            let entry_bytes = rkyv::to_bytes::<_, 256>(&entry)
-                .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
-            let entry_bytes = entry_bytes.as_ref();
-            buf.write_u32::<LittleEndian>(entry_bytes.len() as u32)
-                .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
-            buf.extend_from_slice(entry_bytes);
-        }
+            })
+            .collect();
 
-        self.storage.put(&wal_path, buf).await?;
-        Ok(Some(wal_path))
+        self.write_entries(&entries).await
     }
 
     pub async fn write_delete(&self, ids: Vec<String>) -> Result<Option<String>, StorageError> {
@@ -85,23 +74,29 @@ impl<S: Store> Writer<S> {
             return Ok(None);
         }
 
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        let wal_id = Uuid::new_v4().to_string();
-        let wal_path = wal_path(&self.namespace, &date, &wal_id);
-
         let entry = Entry {
             ts: now_ts_nanos(),
             op: "delete".to_string(),
             doc: None,
             delete_ids: ids,
         };
-        let entry_bytes = rkyv::to_bytes::<_, 256>(&entry)
-            .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
-        let entry_bytes = entry_bytes.as_ref();
-        let mut buf = Vec::with_capacity(entry_bytes.len() + 4);
-        buf.write_u32::<LittleEndian>(entry_bytes.len() as u32)
-            .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
-        buf.extend_from_slice(entry_bytes);
+
+        self.write_entries(&[entry]).await
+    }
+
+    pub async fn write_entries(&self, entries: &[Entry]) -> Result<Option<String>, StorageError> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let wal_id = Uuid::new_v4().to_string();
+        let wal_path = wal_path(&self.namespace, &date, &wal_id);
+
+        let mut buf = Vec::new();
+        for entry in entries {
+            encode_entry(entry, &mut buf)?;
+        }
 
         self.storage.put(&wal_path, buf).await?;
         Ok(Some(wal_path))
@@ -183,4 +178,14 @@ fn now_ts_nanos() -> i64 {
     Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or_else(|| Utc::now().timestamp_millis() * 1_000_000)
+}
+
+fn encode_entry(entry: &Entry, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    let entry_bytes = rkyv::to_bytes::<_, 256>(entry)
+        .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
+    let entry_bytes = entry_bytes.as_ref();
+    buf.write_u32::<LittleEndian>(entry_bytes.len() as u32)
+        .map_err(|err| StorageError::Other(format!("encode WAL entry: {}", err)))?;
+    buf.extend_from_slice(entry_bytes);
+    Ok(())
 }

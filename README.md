@@ -28,10 +28,12 @@ namespaces/{namespace}/
     latest.json          # Current state
     {version}.json       # Versioned snapshots
   wal/
-    {date}/{uuid}.jsonl  # Write-ahead log
+    {date}/{uuid}.wal    # Write-ahead log
   segments/
     {segment_id}.tpvs    # Vector segments
     {segment_id}.hnsw    # HNSW index graph
+  tombstones/
+    latest.rkyv          # Deleted IDs
 ```
 
 ## API Reference
@@ -165,6 +167,8 @@ Health check.
 | `HNSW_M` | No | `16` | HNSW max connections per node |
 | `HNSW_EF_CONSTRUCTION` | No | `200` | HNSW build-time beam width |
 | `HNSW_EF_SEARCH` | No | `100` | HNSW query-time beam width |
+| `WAL_BATCH_MAX_ENTRIES` | No | `1` | Max WAL entries per batch write (ingest) |
+| `WAL_BATCH_FLUSH_INTERVAL` | No | `0ms` | Max time to wait before flushing WAL batch |
 
 ## Development
 
@@ -293,7 +297,7 @@ Recommended for ingest:
 
 - Brute-force search (no ANN index yet)
 - Single namespace per deployment
-- Full compaction (rebuilds entire dataset)
+- Incremental compaction only (no segment merging yet)
 - No streaming/pagination for large result sets
 
 ## License
