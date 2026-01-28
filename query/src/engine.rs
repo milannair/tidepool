@@ -8,7 +8,7 @@ use tracing::info;
 use tidepool_common::document::{QueryRequest, QueryResponse, VectorResult};
 use tidepool_common::manifest::{Manifest, Manager};
 use tidepool_common::segment::{Reader, ReaderOptions, SegmentData};
-use tidepool_common::storage::{segment_index_path, segment_ivf_path, Store};
+use tidepool_common::storage::{segment_index_path, segment_ivf_path, segment_quant_path, Store};
 use tidepool_common::tombstone::Manager as TombstoneManager;
 use tidepool_common::vector::DistanceMetric;
 
@@ -26,11 +26,15 @@ pub struct Engine<S: Store + Clone> {
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
     pub hnsw_ef_search: usize,
+    pub quantization_rerank_factor: usize,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        Self { hnsw_ef_search: 0 }
+        Self {
+            hnsw_ef_search: 0,
+            quantization_rerank_factor: 4,
+        }
     }
 }
 
@@ -53,6 +57,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             cache_dir.clone(),
             ReaderOptions {
                 hnsw_ef_search: opts.hnsw_ef_search,
+                quantization_rerank_factor: opts.quantization_rerank_factor,
             },
         );
 
@@ -175,6 +180,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
                     valid_keys.push(seg.segment_key.clone());
                     valid_keys.push(segment_index_path(&self.namespace, &seg.id));
                     valid_keys.push(segment_ivf_path(&self.namespace, &seg.id));
+                    valid_keys.push(segment_quant_path(&self.namespace, &seg.id));
                 }
                 let removed = self.segment_reader.cleanup_cache(&valid_keys).await;
                 if removed > 0 {
@@ -228,7 +234,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             let filters = filters.clone();
             let nprobe = nprobe;
             let handle = tokio::task::spawn_blocking(move || {
-                let max_k = seg_data.vectors.len().min(per_segment_k);
+                let max_k = seg_data.len().min(per_segment_k);
                 let results = seg_data.search(&query_vector, max_k, metric, filters.as_ref(), ef_search, nprobe);
                 let mut out = Vec::with_capacity(results.len());
                 for r in results {
@@ -239,7 +245,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
                         dist: r.dist,
                     };
                     if include_vectors {
-                        result.vector = seg_data.vectors[r.index].clone();
+                        result.vector = seg_data.vector_owned(r.index).unwrap_or_default();
                     }
                     out.push(result);
                 }

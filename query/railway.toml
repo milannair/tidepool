@@ -1,4 +1,24 @@
 # Railway configuration for tidepool-query service
+#
+# Required environment variables (set in Railway Dashboard → Variables):
+#   AWS_ACCESS_KEY_ID      - S3/R2 access key
+#   AWS_SECRET_ACCESS_KEY  - S3/R2 secret key
+#   AWS_ENDPOINT_URL       - S3 endpoint (e.g., https://<account>.r2.cloudflarestorage.com)
+#   AWS_REGION             - S3 region (e.g., auto for R2)
+#   BUCKET_NAME            - S3 bucket name
+#
+# Optional tuning (defaults are production-ready):
+#   NAMESPACE              - Vector namespace (default: "default")
+#   CACHE_DIR              - Local cache directory (default: "/data")
+#   HNSW_EF_SEARCH         - HNSW search quality (default: "100", higher = better recall)
+#   IVF_NPROBE_DEFAULT     - IVF clusters to search (default: "10", higher = better recall)
+#   QUANTIZATION_RERANK_FACTOR - Rerank multiplier for quantized search (default: "4")
+#   MAX_TOP_K              - Maximum results per query (default: "1000")
+#
+# Performance tips:
+#   - Attach a volume to /data for segment caching (faster queries)
+#   - Increase HNSW_EF_SEARCH for better recall (slower queries)
+#   - Increase IVF_NPROBE_DEFAULT for better recall with large datasets
 
 [build]
 builder = "dockerfile"

@@ -73,6 +73,7 @@ async fn main() {
             ivf_min_k: cfg.ivf_min_k,
             ivf_max_k: cfg.ivf_max_k,
             ivf_nprobe_default: cfg.ivf_nprobe_default,
+            quantization: cfg.quantization,
             ..WriterOptions::default()
         },
     );

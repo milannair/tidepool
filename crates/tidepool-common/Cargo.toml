@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 byteorder = "1"
 memmap2 = "0.9"
 uuid = { version = "1", features = ["v4"] }
+half = "2"
 
 [dev-dependencies]
 criterion = "0.5"

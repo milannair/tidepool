@@ -87,6 +87,51 @@ pub struct SegmentHeader {
     pub attr_len: u64,
 }
 
+/// Parsed layout for segment v2 (offsets in bytes)
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentLayout {
+    pub vector_count: usize,
+    pub dimensions: usize,
+    pub flags: u32,
+    pub norm_offset: usize,
+    pub vector_offset: usize,
+    pub id_offset: usize,
+    pub string_table_offset: usize,
+    pub attr_offset: usize,
+    pub attr_len: usize,
+}
+
+impl SegmentLayout {
+    pub fn parse(data: &[u8]) -> Result<Self, StorageError> {
+        let header = SegmentHeader::from_bytes(data)?;
+        if &header.magic != MAGIC_V2 {
+            return Err(StorageError::Other("invalid v2 segment magic".into()));
+        }
+        if header.version != 2 {
+            return Err(StorageError::Other(format!(
+                "unsupported segment version: {}",
+                header.version
+            )));
+        }
+        Ok(Self {
+            vector_count: header.vector_count as usize,
+            dimensions: header.dimensions as usize,
+            flags: header.flags,
+            norm_offset: header.norm_offset as usize,
+            vector_offset: header.vector_offset as usize,
+            id_offset: header.id_offset as usize,
+            string_table_offset: header.string_table_offset as usize,
+            attr_offset: header.attr_offset as usize,
+            attr_len: header.attr_len as usize,
+        })
+    }
+
+    #[inline]
+    pub fn is_normalized(&self) -> bool {
+        self.flags & flags::VECTORS_NORMALIZED != 0
+    }
+}
+
 impl SegmentHeader {
     /// Parse header from bytes
     fn from_bytes(data: &[u8]) -> Result<Self, StorageError> {

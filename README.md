@@ -1,8 +1,36 @@
 # Tidepool
 
-A lightweight vector database backed by object storage. Inspired by [Turbopuffer](https://turbopuffer.com/).
+A high-performance vector database designed for cost-effective deployment on cloud infrastructure. Tidepool uses object storage (S3, R2, MinIO) as the primary data store, enabling horizontal scaling without the complexity of distributed consensus.
 
-Deploy on Railway with Railway Buckets as the storage backend.
+## Features
+
+- **Hybrid Indexing** - HNSW for small segments, IVF with k-means clustering for large segments
+- **Vector Quantization** - SQ8 (4× compression) and f16 (2× compression) with asymmetric search
+- **SIMD Acceleration** - AVX2/FMA on x86_64, NEON on ARM64, with automatic runtime detection
+- **Zero-Copy Access** - Memory-mapped segments eliminate deserialization overhead
+- **Attribute Filtering** - Filter search results by metadata attributes
+- **S3-Compatible** - Works with AWS S3, Cloudflare R2, MinIO, and other S3-compatible storage
+- **Stateless Architecture** - Query and ingest services scale independently
+
+## Quick Start
+
+```bash
+# Start services with Docker Compose (includes MinIO for local S3)
+docker-compose up -d
+
+# Insert vectors (ingest service on port 8081)
+curl -X POST http://localhost:8081/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{"vectors": [{"id": "1", "vector": [0.1, 0.2, 0.3], "attributes": {"title": "Example"}}]}'
+
+# Trigger compaction (or wait for automatic compaction)
+curl -X POST http://localhost:8081/compact
+
+# Query vectors (query service on port 8080)
+curl -X POST http://localhost:8080/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, 0.3], "top_k": 10}'
+```
 
 ## Architecture
 
@@ -17,7 +45,7 @@ Tidepool consists of two stateless services:
 - All data files are immutable
 - Query service never writes to object storage
 - Ingest service is the only writer
-- Local disk is disposable cache
+- Local disk is disposable cache (mmap for zero-copy access)
 - No coordination between services
 
 ## Storage Layout
@@ -30,12 +58,48 @@ namespaces/{namespace}/
   wal/
     {date}/{uuid}.wal    # Write-ahead log
   segments/
-    {segment_id}.tpvs    # Vector segments
+    {segment_id}.tpvs    # Vector segments (TPV2 binary format)
     {segment_id}.hnsw    # HNSW index graph
-    {segment_id}.ivf     # IVF centroid index
+    {segment_id}.ivf     # IVF centroid index (for large segments)
+    {segment_id}.tpq     # Quantized vectors sidecar (SQ8/f16)
   tombstones/
     latest.rkyv          # Deleted IDs
 ```
+
+## Performance
+
+### Indexing Strategy
+
+| Segment Size | Index Type | Search Complexity |
+|--------------|------------|-------------------|
+| < 10,000 vectors | HNSW | O(log n) |
+| ≥ 10,000 vectors | IVF + Quantization | O(√n × nprobe) |
+
+- **HNSW**: Hierarchical Navigable Small World graph for sub-linear approximate nearest neighbor search
+- **IVF**: Inverted file index with k-means clustering; searches only relevant partitions
+- **Quantization**: SQ8 provides 4× compression using asymmetric distance (f32 query, int8 database)
+
+### Memory Efficiency
+
+Approximate resource usage with SQ8 quantization (default):
+
+| Vector Count | Dimensions | Disk Usage | Query RAM |
+|--------------|------------|------------|-----------|
+| 100,000 | 768 | ~100 MB | ~50 MB |
+| 1,000,000 | 768 | ~1 GB | ~500 MB |
+| 3,000,000 | 768 | ~3 GB | ~1.5 GB |
+
+### SIMD Optimization
+
+Distance computations use platform-specific SIMD instructions when available:
+
+| Platform | Instructions | Operations per Cycle |
+|----------|--------------|---------------------|
+| x86_64 | AVX2 + FMA | 8-wide f32 |
+| ARM64 | NEON | 4-wide f32 |
+| Other | Scalar | 1-wide f32 |
+
+Runtime feature detection selects the optimal implementation automatically.
 
 ## API Reference
 
@@ -175,20 +239,44 @@ Health check.
 | `IVF_K_FACTOR` | No | `1.0` | IVF k scaling factor (k ≈ sqrt(n) * factor) |
 | `IVF_MIN_K` | No | `16` | IVF minimum cluster count |
 | `IVF_MAX_K` | No | `65535` | IVF maximum cluster count |
+| `QUANTIZATION` | No | `sq8` | Vector compression: `none`, `f16`, `sq8` |
+| `QUANTIZATION_RERANK_FACTOR` | No | `4` | Fetch N× candidates, rerank with full precision |
 | `WAL_BATCH_MAX_ENTRIES` | No | `1` | Max WAL entries per batch write (ingest) |
 | `WAL_BATCH_FLUSH_INTERVAL` | No | `0ms` | Max time to wait before flushing WAL batch |
 
-**IVF migration note:** Existing segments without `.ivf` continue to query via HNSW. Run compaction after enabling IVF to build new IVF indexes for large segments.
+### Quantization Modes
+
+| Mode | Compression | Memory (1M × 768-dim) | Recall | Description |
+|------|-------------|----------------------|--------|-------------|
+| `none` | 1× | 3 GB | 100% | Full precision (f32) |
+| `f16` | 2× | 1.5 GB | ~99% | Half precision |
+| `sq8` | 4× | 768 MB | ~97% | 8-bit scalar quantization (default) |
+
+SQ8 is the default configuration. The `QUANTIZATION_RERANK_FACTOR` parameter controls the number of candidates fetched before reranking with full-precision vectors.
+
+**Migration note:** Existing segments without IVF indexes continue to use HNSW for queries. Trigger compaction to build IVF indexes for large segments.
 
 ## Development
 
 ### Prerequisites
 
 - Rust 1.93+
-- Docker (optional)
-- S3-compatible storage (MinIO for local dev)
+- Docker (for local development)
 
-### Local Development
+### Local Development with Docker Compose
+
+```bash
+# Start everything
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop and clean up
+docker-compose down -v
+```
+
+### Local Development without Docker
 
 1. Start MinIO:
 
@@ -218,18 +306,24 @@ export BUCKET_NAME=tidepool
 4. Run services:
 
 ```bash
-# Terminal 1 - Query
+# Terminal 1 - Query (port 8080)
 cargo run -p tidepool-query
 
-# Terminal 2 - Ingest
-cargo run -p tidepool-ingest
+# Terminal 2 - Ingest (port 8081)
+PORT=8081 cargo run -p tidepool-ingest
 ```
 
-### Benchmarks & Recall
+### Benchmarks
 
 ```bash
-# HNSW search benchmarks + recall sanity checks
+# HNSW search benchmarks + recall measurement
 cargo bench -p tidepool-common --bench hnsw
+
+# SIMD distance kernel benchmarks
+cargo bench -p tidepool-common --bench simd
+
+# IVF index construction benchmarks
+cargo bench -p tidepool-common --bench ivf
 ```
 
 ### Example Usage
@@ -257,57 +351,88 @@ curl -X POST http://localhost:8080/v1/vectors/default \
   }'
 ```
 
-## Railway Template (Two Services)
+## Deployment
 
-This repo is set up for a Railway template with **two services**:
+### Railway
 
-- **tidepool-query** (read-only API)
-- **tidepool-ingest** (writer + compactor)
+This repository includes Railway configuration for a two-service deployment:
 
-### Template Setup
+- **tidepool-query**: Read-only vector search API
+- **tidepool-ingest**: Write API with background compaction
 
-1. Create a new Railway project from this repo.
-2. Add two services and point each to its config file (absolute paths).
-   - **tidepool-query** → `/query/railway.toml`
-   - **tidepool-ingest** → `/ingest/railway.toml`
-3. Set **Root Directory** for both services to `/` (repo root).
-4. Add a Railway Object Storage (S3-compatible bucket).
-5. Add the bucket env vars to both services (see below).
-6. Optional: add a volume at `/data` for query caching.
+#### Setup
 
-Note: Railway config-as-code (`railway.toml`/`railway.json`) applies to a single
-service deployment, while multi-service templates are created from a Railway
-project in the UI. See `TEMPLATE.md` for the exact steps.
+1. Create a new Railway project from this repository
+2. Add two services using the provided configuration files:
+   - `tidepool-query` → `query/railway.toml`
+   - `tidepool-ingest` → `ingest/railway.toml`
+3. Set **Root Directory** to `/` (repository root) for both services
+4. Add Railway Object Storage and configure the S3 environment variables
+5. (Optional) Attach a volume at `/data` to the query service for caching
 
-If a build uses Railpack and fails with `no Rust files in /app`, the service is not
-using the Dockerfile builder. In Railway, set the service **Builder** to
-Dockerfile or add the env var `RAILWAY_DOCKERFILE_PATH` (already set in the
-service `railway.toml`).
+#### Troubleshooting
 
-### Railway Environment Variables
+If the build fails with `no Rust files in /app`, ensure the service is configured to use the Dockerfile builder. The `RAILWAY_DOCKERFILE_PATH` environment variable is pre-configured in each `railway.toml`.
 
-Set these for both services:
-- `AWS_ACCESS_KEY_ID` - from Railway bucket
-- `AWS_SECRET_ACCESS_KEY` - from Railway bucket  
-- `AWS_ENDPOINT_URL` - from Railway bucket
-- `AWS_REGION` - from Railway bucket
-- `BUCKET_NAME` - your bucket name
+#### Environment Variables
 
-Recommended for ingest:
-- `COMPACTION_INTERVAL` - e.g. `5m`
+**Required** (configure for both services using Railway Object Storage credentials):
+
+| Variable | Description |
+|----------|-------------|
+| `AWS_ACCESS_KEY_ID` | S3 access key |
+| `AWS_SECRET_ACCESS_KEY` | S3 secret key |
+| `AWS_ENDPOINT_URL` | S3 endpoint URL |
+| `AWS_REGION` | S3 region |
+| `BUCKET_NAME` | S3 bucket name |
+
+**Optional tuning:**
+
+| Variable | Service | Default | Description |
+|----------|---------|---------|-------------|
+| `QUANTIZATION` | ingest | `sq8` | Vector compression (`none`, `f16`, `sq8`) |
+| `IVF_NPROBE_DEFAULT` | query | `10` | Number of IVF partitions to search |
+| `HNSW_EF_SEARCH` | query | `100` | HNSW search beam width |
+| `COMPACTION_INTERVAL` | ingest | `5m` | Background compaction frequency |
+
+**Recommended:** Attach a persistent volume at `/data` on the query service to enable segment caching.
 
 ## How It Works
 
-1. **Upsert**: Vectors are written to WAL files in S3
-2. **Compaction**: Background worker merges WAL into segments with HNSW index
-3. **Query**: Loads segments, performs HNSW similarity search
-4. **Delete**: Tombstones written to WAL, applied during compaction
+### Write Path (Ingest Service)
 
-## Limitations (v0)
+1. **Upsert**: Vectors written to WAL files in S3 (immediate durability)
+2. **Compaction** (background, every 5min by default):
+   - Reads WAL entries
+   - Builds segment file (`.tpvs`) with 32-byte aligned vectors
+   - Builds HNSW index (`.hnsw`) for small segments
+   - Builds IVF index (`.ivf`) + quantized vectors (`.tpq`) for large segments
+   - Updates manifest
+   - Deletes processed WAL files
+3. **Delete**: Tombstones written to WAL, filtered out during queries
 
-- Single namespace per deployment
-- Incremental compaction only (no segment merging yet)
-- No streaming/pagination for large result sets
+### Read Path (Query Service)
+
+1. **Load manifest** from S3 (lists active segments)
+2. **Fetch segments** from S3 → local cache (mmap for zero-copy)
+3. **Search** each segment in parallel:
+   - Small segment: HNSW graph traversal
+   - Large segment: IVF centroid routing → quantized scan → f32 rerank
+4. **Merge** results across segments, apply tombstones
+5. **Return** top-k results
+
+### Architecture Benefits
+
+- **Cost Efficiency**: Object storage pricing (~$0.02/GB/month) vs block storage
+- **Durability**: S3-class durability (11 nines) without manual backup configuration
+- **Horizontal Scaling**: Add query instances that share the same S3 data
+- **Operational Simplicity**: No distributed consensus or leader election
+
+## Current Limitations
+
+- Single namespace per service deployment
+- Eventual consistency model (vectors become queryable after compaction)
+- No cursor-based pagination for result sets exceeding `top_k`
 
 ## License
 

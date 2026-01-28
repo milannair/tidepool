@@ -3118,6 +3118,7 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "half",
  "hex",
  "humantime",
  "memmap2",

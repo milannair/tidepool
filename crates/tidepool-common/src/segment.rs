@@ -19,8 +19,16 @@ use crate::attributes::AttrValue;
 use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
 use crate::index::ivf::IVFIndex;
-use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentView};
-use crate::storage::{segment_index_path, segment_ivf_path, segment_path, Store, StorageError};
+use crate::quantization::{self, QuantizationKind, QuantizedVectors, Sq8Query};
+use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentLayout, SegmentView};
+use crate::storage::{
+    segment_index_path,
+    segment_ivf_path,
+    segment_path,
+    segment_quant_path,
+    Store,
+    StorageError,
+};
 use crate::vector::{distance_with_norms, DistanceMetric};
 
 /// Segment data - supports both owned (v1) and zero-copy (v2) modes
@@ -38,16 +46,24 @@ pub struct SegmentData {
     pub index: Option<HnswIndex>,
     /// IVF index for ANN search (large segments)
     pub ivf_index: Option<IVFIndex>,
+    /// Quantized vectors for IVF search
+    pub quantization: Option<QuantizedVectors>,
     /// Filter index for attribute queries
     pub filters: Option<FilterIndex>,
     /// Raw segment data for zero-copy v2 access (kept for lifetime)
     #[allow(dead_code)]
     raw_data: Option<Arc<SegmentBytes>>,
+    /// Parsed layout for v2 segments (used for on-demand vector access)
+    raw_layout: Option<SegmentLayout>,
     /// Precomputed norms (for v2, stored in file; for v1, computed here)
     norms: Vec<f32>,
     /// Whether this is v2 format
     #[allow(dead_code)]
     is_v2: bool,
+    /// Total vector count (may differ from vectors.len when quantized)
+    vector_count: usize,
+    /// Quantized rerank factor for IVF (>=1)
+    quantization_rerank_factor: usize,
 }
 
 impl std::fmt::Debug for SegmentData {
@@ -55,9 +71,11 @@ impl std::fmt::Debug for SegmentData {
         f.debug_struct("SegmentData")
             .field("ids_len", &self.ids.len())
             .field("vectors_len", &self.vectors.len())
+            .field("vector_count", &self.vector_count)
             .field("dimensions", &self.dimensions)
             .field("has_index", &self.index.is_some())
             .field("has_ivf", &self.ivf_index.is_some())
+            .field("has_quant", &self.quantization.is_some())
             .field("is_v2", &self.is_v2)
             .finish()
     }
@@ -96,6 +114,8 @@ pub struct WriterOptions {
     pub ivf_max_iters: usize,
     /// IVF deterministic seed
     pub ivf_seed: u64,
+    /// Quantization mode for IVF segments
+    pub quantization: QuantizationKind,
 }
 
 impl Default for WriterOptions {
@@ -114,6 +134,7 @@ impl Default for WriterOptions {
             ivf_nprobe_default: 10,
             ivf_max_iters: 25,
             ivf_seed: 42,
+            quantization: QuantizationKind::None,
         }
     }
 }
@@ -180,6 +201,24 @@ impl<S: Store> Writer<S> {
         self.storage.put(&segment_key, buf).await?;
 
         let use_ivf = self.opts.ivf_enabled && docs.len() >= self.opts.ivf_min_segment_size;
+        let mut quant_key: Option<String> = None;
+        if self.opts.use_v2_format
+            && use_ivf
+            && self.opts.quantization != QuantizationKind::None
+        {
+            let vector_refs: Vec<&[f32]> = docs.iter().map(|d| d.vector.as_slice()).collect();
+            let quant = quantization::quantize(&vector_refs, self.opts.quantization)
+                .map_err(|e| StorageError::Other(format!("quantize vectors: {}", e)))?;
+            let quant_data = quantization::marshal_binary(&quant)
+                .map_err(|e| StorageError::Other(format!("serialize quantization: {}", e)))?;
+            let key = segment_quant_path(&self.namespace, &segment_id);
+            if let Err(err) = self.storage.put(&key, quant_data).await {
+                let _ = self.storage.delete(&segment_key).await;
+                return Err(err);
+            }
+            quant_key = Some(key);
+        }
+
         if use_ivf {
             let vector_refs: Vec<&[f32]> = docs.iter().map(|d| d.vector.as_slice()).collect();
             let k = IVFIndex::compute_k(
@@ -203,6 +242,9 @@ impl<S: Store> Writer<S> {
             let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
             if let Err(err) = self.storage.put(&ivf_key, ivf_data).await {
                 let _ = self.storage.delete(&segment_key).await;
+                if let Some(quant_key) = &quant_key {
+                    let _ = self.storage.delete(quant_key).await;
+                }
                 return Err(err);
             }
         } else {
@@ -223,6 +265,9 @@ impl<S: Store> Writer<S> {
             let index_key = segment_index_path(&self.namespace, &segment_id);
             if let Err(err) = self.storage.put(&index_key, hnsw_data).await {
                 let _ = self.storage.delete(&segment_key).await;
+                if let Some(quant_key) = &quant_key {
+                    let _ = self.storage.delete(quant_key).await;
+                }
                 return Err(err);
             }
         }
@@ -278,12 +323,14 @@ impl<S: Store> Writer<S> {
 #[derive(Debug, Clone)]
 pub struct ReaderOptions {
     pub hnsw_ef_search: usize,
+    pub quantization_rerank_factor: usize,
 }
 
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             hnsw_ef_search: DEFAULT_EF_SEARCH,
+            quantization_rerank_factor: 4,
         }
     }
 }
@@ -294,6 +341,7 @@ pub struct Reader<S: Store> {
     namespace: String,
     cache_dir: Option<String>,
     hnsw_ef_search: usize,
+    quantization_rerank_factor: usize,
 }
 
 impl<S: Store> Reader<S> {
@@ -315,6 +363,7 @@ impl<S: Store> Reader<S> {
             namespace: namespace.into(),
             cache_dir,
             hnsw_ef_search: opts.hnsw_ef_search,
+            quantization_rerank_factor: opts.quantization_rerank_factor.max(1),
         }
     }
 
@@ -335,6 +384,7 @@ impl<S: Store> Reader<S> {
         let data = Arc::new(data);
         let bytes = data.as_slice();
         
+        let layout = SegmentLayout::parse(bytes)?;
         // SAFETY: We verify the format and bounds in SegmentView::from_bytes
         let view = unsafe { SegmentView::from_bytes(bytes)? };
         
@@ -345,13 +395,6 @@ impl<S: Store> Reader<S> {
         let mut ids = Vec::with_capacity(num_vectors);
         for i in 0..num_vectors {
             ids.push(view.id_string(i).unwrap_or("").to_string());
-        }
-        
-        // Extract vectors (needed for HNSW which stores references)
-        // TODO: In future, make HNSW work with zero-copy views
-        let mut vectors = Vec::with_capacity(num_vectors);
-        for i in 0..num_vectors {
-            vectors.push(view.vector(i).to_vec());
         }
         
         // Extract norms
@@ -383,36 +426,71 @@ impl<S: Store> Reader<S> {
             vec![None; num_vectors]
         };
         
+        // Load IVF index + quantization sidecar (if present)
+        let mut ivf_index = None;
+        let mut quantization = None;
+        if let Some(segment_id) = segment_id_from_key(segment_key) {
+            let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
+            if self.storage.exists(&ivf_key).await.unwrap_or(false) {
+                if let Ok(ivf_data) = self.get_ivf_data(&ivf_key).await {
+                    if let Ok(ivf) = IVFIndex::load_binary(ivf_data.as_slice()) {
+                        ivf_index = Some(ivf);
+                    }
+                }
+            }
+            let quant_key = segment_quant_path(&self.namespace, &segment_id);
+            if self.storage.exists(&quant_key).await.unwrap_or(false) {
+                if let Ok(quant_data) = self.get_quant_data(&quant_key).await {
+                    if let Ok(q) = quantization::load_binary(quant_data.as_slice()) {
+                        if q.dimensions == dimensions && q.vector_count == num_vectors {
+                            quantization = Some(q);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extract vectors if needed (before moving data into struct)
+        let need_vectors = ivf_index.is_none() || quantization.is_none();
+        let vectors = if need_vectors {
+            // Extract vectors (needed for HNSW or exact IVF scan)
+            let mut vecs = Vec::with_capacity(num_vectors);
+            for i in 0..num_vectors {
+                vecs.push(view.vector(i).to_vec());
+            }
+            vecs
+        } else {
+            Vec::new()
+        };
+
         let mut seg = SegmentData {
             ids,
             vectors,
             attributes: attrs,
             dimensions,
             index: None,
-            ivf_index: None,
+            ivf_index,
+            quantization,
             filters: None,
             raw_data: Some(data),
+            raw_layout: Some(layout),
             norms,
             is_v2: true,
+            vector_count: num_vectors,
+            quantization_rerank_factor: self.quantization_rerank_factor,
         };
-        
-        // Load HNSW index
-        if let Some(segment_id) = segment_id_from_key(segment_key) {
-            let index_key = segment_index_path(&self.namespace, &segment_id);
-            if self.storage.exists(&index_key).await.unwrap_or(false) {
-                if let Ok(index_data) = self.get_index_data(&index_key).await {
-                    if let Ok(hnsw) =
-                        HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
-                    {
-                        seg.index = Some(hnsw);
-                    }
-                }
-            }
-            let ivf_key = segment_ivf_path(&self.namespace, &segment_id);
-            if self.storage.exists(&ivf_key).await.unwrap_or(false) {
-                if let Ok(ivf_data) = self.get_ivf_data(&ivf_key).await {
-                    if let Ok(ivf) = IVFIndex::load_binary(ivf_data.as_slice()) {
-                        seg.ivf_index = Some(ivf);
+
+        // Load HNSW index only when IVF is not present
+        if seg.ivf_index.is_none() {
+            if let Some(segment_id) = segment_id_from_key(segment_key) {
+                let index_key = segment_index_path(&self.namespace, &segment_id);
+                if self.storage.exists(&index_key).await.unwrap_or(false) {
+                    if let Ok(index_data) = self.get_index_data(&index_key).await {
+                        if let Ok(hnsw) =
+                            HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
+                        {
+                            seg.index = Some(hnsw);
+                        }
                     }
                 }
             }
@@ -505,10 +583,14 @@ impl<S: Store> Reader<S> {
             dimensions,
             index: None,
             ivf_index: None,
+            quantization: None,
             filters: None,
             raw_data: None,
+            raw_layout: None,
             norms,
             is_v2: false,
+            vector_count: num_vectors,
+            quantization_rerank_factor: self.quantization_rerank_factor,
         };
 
         if let Some(segment_id) = segment_id_from_key(segment_key) {
@@ -590,6 +672,24 @@ impl<S: Store> Reader<S> {
         Ok(SegmentBytes::Owned(data))
     }
 
+    async fn get_quant_data(&self, quant_key: &str) -> Result<SegmentBytes, StorageError> {
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(quant_key, "tpq"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
+            if let Ok(data) = fs::read(&cache_path).await {
+                return Ok(SegmentBytes::Owned(data));
+            }
+        }
+        let data = self.storage.get(quant_key).await?;
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(quant_key, "tpq"));
+            let _ = fs::write(cache_path, &data).await;
+        }
+        Ok(SegmentBytes::Owned(data))
+    }
+
     /// Remove cached files for segments not in the valid set.
     /// Call this after loading a new manifest to clean up stale cache entries.
     /// Returns the number of files removed.
@@ -615,8 +715,12 @@ impl<S: Store> Reader<S> {
                 continue;
             };
 
-            // Only process our cache files (.tpvs, .hnsw, .ivf)
-            if !filename.ends_with(".tpvs") && !filename.ends_with(".hnsw") && !filename.ends_with(".ivf") {
+            // Only process our cache files (.tpvs, .hnsw, .ivf, .tpq)
+            if !filename.ends_with(".tpvs")
+                && !filename.ends_with(".hnsw")
+                && !filename.ends_with(".ivf")
+                && !filename.ends_with(".tpq")
+            {
                 continue;
             }
 
@@ -682,19 +786,51 @@ impl SegmentData {
     /// Get the number of vectors
     #[inline]
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.vector_count
     }
     
     /// Check if empty
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.vector_count == 0
     }
     
     /// Get vector by index
     #[inline]
     pub fn vector(&self, index: usize) -> &[f32] {
-        &self.vectors[index]
+        self.vector_slice(index).expect("vector not available")
+    }
+
+    /// Get vector slice by index (owned vectors or mmap-backed)
+    #[inline]
+    pub fn vector_slice(&self, index: usize) -> Option<&[f32]> {
+        if index >= self.vector_count {
+            return None;
+        }
+        if !self.vectors.is_empty() {
+            return self.vectors.get(index).map(|v| v.as_slice());
+        }
+        let layout = self.raw_layout?;
+        let data = self.raw_data.as_ref()?;
+        let dims = layout.dimensions;
+        let start = layout.vector_offset + index * dims * std::mem::size_of::<f32>();
+        let end = start + dims * std::mem::size_of::<f32>();
+        let bytes = data.as_slice();
+        if end > bytes.len() {
+            return None;
+        }
+        unsafe {
+            Some(std::slice::from_raw_parts(
+                bytes.as_ptr().add(start) as *const f32,
+                dims,
+            ))
+        }
+    }
+
+    /// Get vector by index as an owned Vec (for API responses)
+    #[inline]
+    pub fn vector_owned(&self, index: usize) -> Option<Vec<f32>> {
+        self.vector_slice(index).map(|v| v.to_vec())
     }
     
     /// Get precomputed norm for vector
@@ -703,7 +839,9 @@ impl SegmentData {
         if index < self.norms.len() {
             self.norms[index]
         } else {
-            compute_norm(&self.vectors[index])
+            self.vector_slice(index)
+                .map(compute_norm)
+                .unwrap_or(0.0)
         }
     }
     
@@ -716,7 +854,10 @@ impl SegmentData {
         ef_search: usize,
         nprobe: usize,
     ) -> Vec<ScoredResult> {
-        let top_k = if top_k == 0 { self.vectors.len() } else { top_k };
+        if query.is_empty() || query.len() != self.dimensions {
+            return Vec::new();
+        }
+        let top_k = if top_k == 0 { self.len() } else { top_k };
 
         if let Some(ivf) = &self.ivf_index {
             return self.ivf_search(query, top_k, ivf.metric, filters, nprobe);
@@ -763,7 +904,7 @@ impl SegmentData {
             return Vec::new();
         };
 
-        let top_k = top_k.min(self.vectors.len());
+        let top_k = top_k.min(self.len());
         if top_k == 0 || query.is_empty() {
             return Vec::new();
         }
@@ -805,9 +946,24 @@ impl SegmentData {
         nprobe = nprobe.clamp(1, ivf.k);
         centroid_scores.truncate(nprobe);
 
+        let use_quant = self.quantization.as_ref();
+        let rerank_factor = self.quantization_rerank_factor.max(1);
+        let target_k = if use_quant.is_some() {
+            (top_k * rerank_factor).min(self.len())
+        } else {
+            top_k
+        };
+
+        let mut sq8_query: Option<Sq8Query> = None;
+        if let Some(q) = use_quant {
+            if q.kind == QuantizationKind::SQ8 {
+                sq8_query = Some(Sq8Query::new(query, &q.scales, &q.mins, query_norm));
+            }
+        }
+
         let mut heap: BinaryHeap<(OrderedFloat<f32>, usize)> = BinaryHeap::new();
         for (c, centroid_dist) in centroid_scores {
-            if metric == DistanceMetric::Euclidean && heap.len() >= top_k {
+            if metric == DistanceMetric::Euclidean && heap.len() >= target_k && use_quant.is_none() {
                 let worst = heap.peek().map(|v| v.0.into_inner()).unwrap_or(f32::INFINITY);
                 let worst_l2 = worst.sqrt();
                 let centroid_l2 = centroid_dist.sqrt();
@@ -823,17 +979,68 @@ impl SegmentData {
                     }
                 }
                 let vid = vid as usize;
-                if vid >= self.vectors.len() {
+                if vid >= self.len() {
                     continue;
                 }
-                let dist = distance_with_norms(
-                    query,
-                    &self.vectors[vid],
-                    query_norm,
-                    self.norm(vid),
-                    metric,
-                );
-                if heap.len() < top_k {
+                let dist = if let Some(q) = use_quant {
+                    match q.kind {
+                        QuantizationKind::F16 => q
+                            .vector_bytes(vid)
+                            .map(|bytes| {
+                                quantization::f16_distance(
+                                    query,
+                                    bytes,
+                                    metric,
+                                    query_norm,
+                                    self.norm(vid),
+                                )
+                            })
+                            .or_else(|| {
+                                self.vector_slice(vid).map(|vec| {
+                                    distance_with_norms(
+                                        query,
+                                        vec,
+                                        query_norm,
+                                        self.norm(vid),
+                                        metric,
+                                    )
+                                })
+                            }),
+                        QuantizationKind::SQ8 => q
+                            .vector_bytes(vid)
+                            .and_then(|bytes| sq8_query.as_ref().map(|sq8| (bytes, sq8)))
+                            .map(|(bytes, sq8)| {
+                                quantization::sq8_distance(
+                                    sq8,
+                                    bytes,
+                                    &q.scales,
+                                    &q.mins,
+                                    metric,
+                                    self.norm(vid),
+                                )
+                            })
+                            .or_else(|| {
+                                self.vector_slice(vid).map(|vec| {
+                                    distance_with_norms(
+                                        query,
+                                        vec,
+                                        query_norm,
+                                        self.norm(vid),
+                                        metric,
+                                    )
+                                })
+                            }),
+                        QuantizationKind::None => None,
+                    }
+                } else {
+                    self.vector_slice(vid).map(|vec| {
+                        distance_with_norms(query, vec, query_norm, self.norm(vid), metric)
+                    })
+                };
+
+                let Some(dist) = dist else { continue };
+
+                if heap.len() < target_k {
                     heap.push((OrderedFloat(dist), vid));
                 } else if let Some(mut worst) = heap.peek_mut() {
                     if dist < worst.0.into_inner() {
@@ -843,15 +1050,50 @@ impl SegmentData {
             }
         }
 
-        let mut results = Vec::with_capacity(heap.len());
-        while let Some((dist, index)) = heap.pop() {
-            results.push(ScoredResult {
-                index,
-                dist: dist.into_inner(),
-            });
+        if use_quant.is_some() {
+            let mut candidates = Vec::with_capacity(heap.len());
+            while let Some((dist, index)) = heap.pop() {
+                candidates.push((index, dist.into_inner()));
+            }
+
+            let mut rerank_heap: BinaryHeap<(OrderedFloat<f32>, usize)> = BinaryHeap::new();
+            for (index, approx) in candidates {
+                let dist = self
+                    .vector_slice(index)
+                    .map(|vec| {
+                        distance_with_norms(query, vec, query_norm, self.norm(index), metric)
+                    })
+                    .unwrap_or(approx);
+
+                if rerank_heap.len() < top_k {
+                    rerank_heap.push((OrderedFloat(dist), index));
+                } else if let Some(mut worst) = rerank_heap.peek_mut() {
+                    if dist < worst.0.into_inner() {
+                        *worst = (OrderedFloat(dist), index);
+                    }
+                }
+            }
+
+            let mut results = Vec::with_capacity(rerank_heap.len());
+            while let Some((dist, index)) = rerank_heap.pop() {
+                results.push(ScoredResult {
+                    index,
+                    dist: dist.into_inner(),
+                });
+            }
+            results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            results
+        } else {
+            let mut results = Vec::with_capacity(heap.len());
+            while let Some((dist, index)) = heap.pop() {
+                results.push(ScoredResult {
+                    index,
+                    dist: dist.into_inner(),
+                });
+            }
+            results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            results
         }
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
-        results
     }
 }
 
@@ -1043,10 +1285,14 @@ mod tests {
             dimensions: dims,
             index: None,
             ivf_index: Some(ivf),
+            quantization: None,
             filters: None,
             raw_data: None,
+            raw_layout: None,
             norms,
             is_v2: false,
+            vector_count: count,
+            quantization_rerank_factor: 1,
         };
 
         let query = vectors[0].clone();
