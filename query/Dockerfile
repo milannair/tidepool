@@ -24,18 +24,13 @@ FROM alpine:3.20
 # Install CA certificates
 RUN apk add --no-cache ca-certificates
 
-# Create non-root user and data directory
-RUN adduser -D -u 1000 tidepool && \
-    mkdir -p /data && \
-    chown -R tidepool:tidepool /data
+# Create data directory
+RUN mkdir -p /data
 
 # Copy the binary
 COPY --from=builder /build/tidepool-query /tidepool-query
 
 WORKDIR /
-
-# Run as non-root user
-USER tidepool
 
 EXPOSE 8080
 
