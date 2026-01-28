@@ -1,4 +1,20 @@
 # Railway configuration for tidepool-ingest service
+#
+# Required environment variables (set in Railway Dashboard → Variables):
+#   AWS_ACCESS_KEY_ID      - S3/R2 access key
+#   AWS_SECRET_ACCESS_KEY  - S3/R2 secret key
+#   AWS_ENDPOINT_URL       - S3 endpoint (e.g., https://<account>.r2.cloudflarestorage.com)
+#   AWS_REGION             - S3 region (e.g., auto for R2)
+#   BUCKET_NAME            - S3 bucket name
+#
+# Optional tuning (defaults are production-ready):
+#   NAMESPACE              - Vector namespace (default: "default")
+#   COMPACTION_INTERVAL    - How often to compact WAL (default: "5m")
+#   QUANTIZATION           - none | f16 | sq8 (default: "sq8" - recommended)
+#   IVF_ENABLED            - Enable IVF clustering (default: "true")
+#   IVF_MIN_SEGMENT_SIZE   - Min vectors for IVF (default: "10000")
+#   HNSW_M                 - HNSW graph connectivity (default: "16")
+#   HNSW_EF_CONSTRUCTION   - HNSW build quality (default: "200")
 
 [build]
 builder = "dockerfile"

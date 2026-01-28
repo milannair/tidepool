@@ -235,6 +235,10 @@ pub fn segment_ivf_path(namespace: &str, segment_id: &str) -> String {
     namespace_path(namespace, &format!("segments/{}.ivf", segment_id))
 }
 
+pub fn segment_quant_path(namespace: &str, segment_id: &str) -> String {
+    namespace_path(namespace, &format!("segments/{}.tpq", segment_id))
+}
+
 pub fn tombstone_path(namespace: &str) -> String {
     namespace_path(namespace, "tombstones/latest.rkyv")
 }

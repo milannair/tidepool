@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use humantime::parse_duration;
 
+use crate::quantization::QuantizationKind;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub aws_access_key_id: String,
@@ -29,6 +31,8 @@ pub struct Config {
     pub ivf_k_factor: f32,
     pub ivf_min_k: usize,
     pub ivf_max_k: usize,
+    pub quantization: QuantizationKind,
+    pub quantization_rerank_factor: usize,
     pub wal_batch_max_entries: usize,
     pub wal_batch_flush_interval: Duration,
 }
@@ -60,6 +64,10 @@ impl Config {
             ivf_k_factor: parse_f32("IVF_K_FACTOR", 1.0),
             ivf_min_k: parse_usize("IVF_MIN_K", 16),
             ivf_max_k: parse_usize("IVF_MAX_K", 65_535),
+            quantization: QuantizationKind::parse(
+                env::var("QUANTIZATION").ok().as_deref().or(Some("sq8"))
+            ),
+            quantization_rerank_factor: parse_usize("QUANTIZATION_RERANK_FACTOR", 4),
             wal_batch_max_entries: parse_usize("WAL_BATCH_MAX_ENTRIES", 1),
             wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
         };

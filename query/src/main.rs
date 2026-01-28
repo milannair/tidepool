@@ -52,6 +52,7 @@ async fn main() {
         Some(cfg.cache_dir.clone()),
         EngineOptions {
             hnsw_ef_search: cfg.hnsw_ef_search,
+            quantization_rerank_factor: cfg.quantization_rerank_factor,
         },
     );
 

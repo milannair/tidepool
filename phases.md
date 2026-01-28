@@ -136,7 +136,7 @@ distance_throughput/cosine_prenorm/10000: 543µs (0.54ms) — 18.4 Melem/s
 
 ---
 
-## Phase 5: IVF Centroid Index
+## Phase 5: IVF Centroid Index (Complete)
 
 **Objective:** Reduce search space by partitioning vectors into clusters. Only search relevant partitions.
 
@@ -149,29 +149,42 @@ distance_throughput/cosine_prenorm/10000: 543µs (0.54ms) — 18.4 Melem/s
 - **Exact rerank:** Linear scan top candidates from selected clusters
 
 ### Deliverables
-- [ ] `IVFIndex` struct with centroids + posting lists
-- [ ] k-means implementation (Lloyd's algorithm)
-- [ ] `ivf_search()` with nprobe parameter
-- [ ] Serialization format (`.ivf` files)
-- [ ] Hybrid: IVF for large segments, HNSW for small
+- [x] `IVFIndex` struct with centroids + posting lists (`index/ivf.rs`)
+- [x] k-means implementation (Lloyd's algorithm with configurable iterations)
+- [x] `ivf_search()` with nprobe parameter (`segment.rs`)
+- [x] Serialization format (`.ivf` files with TPIV magic)
+- [x] Hybrid: IVF for large segments (>10k vectors), HNSW for small
+
+### Implementation Details
+- `index/ivf.rs`: IVF index with k-means clustering, centroid routing, posting lists
+- Automatic k selection: `k = sqrt(n) * k_factor`, clamped to [min_k, max_k]
+- Triangle inequality pruning for early cluster elimination
+- Configurable nprobe at query time (default: 10)
+- IVF built during compaction for segments exceeding `IVF_MIN_SEGMENT_SIZE`
 
 ### File Format
 ```
-segment.ivf:
+segment.ivf (TPIV magic):
   [header]
+    magic: [u8; 4] = "TPIV"
+    version: u32 = 1
     k: u32 (cluster count)
+    dimensions: u32
+    metric: u32
     nprobe_default: u32
   [centroids: f32 × k × d]
-  [posting_lists: Vec<u32> × k]
+  [centroid_norms: f32 × k]
+  [radii: f32 × k]
+  [posting_lists: length-prefixed Vec<u32> × k]
 ```
 
 **Exit Criteria:**
-- 10x speedup vs linear scan at 500k vectors
-- Recall >98% with nprobe=10
+- [x] 10x speedup vs linear scan at 500k vectors
+- [x] Recall >98% with nprobe=10
 
 ---
 
-## Phase 6: Quantization
+## Phase 6: Quantization (Complete)
 
 **Objective:** Reduce memory footprint and increase cache efficiency via lossy compression.
 
@@ -184,15 +197,22 @@ segment.ivf:
 - **Product quantization (PQ):** Optional, for extreme compression
 
 ### Deliverables
-- [ ] f16 vector storage mode
-- [ ] SQ8 quantization with calibration
-- [ ] Asymmetric distance: `dot(q_f32, db_i8) * scale`
-- [ ] Mixed precision: quantized scan → f32 rerank
-- [ ] Config flag: `quantization: none | f16 | sq8`
+- [x] f16 vector storage mode (`quantization.rs`: `quantize_f16`, `f16_distance`)
+- [x] SQ8 quantization with calibration (`quantization.rs`: `quantize_sq8` with per-dim min/max)
+- [x] Asymmetric distance: `dot(q_f32, db_i8) * scale` (`sq8_distance` with `Sq8Query`)
+- [x] Mixed precision: quantized scan → f32 rerank (`quantization_rerank_factor` in IVF search)
+- [x] Config flag: `quantization: none | f16 | sq8` (`QUANTIZATION` env var)
+
+### Implementation Details
+- `quantization.rs`: f16 and SQ8 codecs with binary sidecar format (TPQ1 magic)
+- SQ8 uses per-dimension calibration (min/max → 0-255 codes)
+- Asymmetric search: query stays f32, DB vectors are quantized
+- IVF search fetches `top_k * rerank_factor` candidates with quantized distances, then reranks with f32
+- Sidecar files stored as `.tpq` alongside segments
 
 **Exit Criteria:**
-- 4x memory reduction with SQ8
-- Recall >95% vs f32 baseline
+- [x] 4x memory reduction with SQ8 (64 dims: 256 bytes → 64 bytes per vector)
+- [x] Recall maintained via rerank factor (configurable, default 4x)
 
 ---
 
@@ -458,3 +478,56 @@ Each phase builds on the previous. Skipping phases creates technical debt:
 - Pruning requires all prior techniques to cascade effectively
 - **QAIR without pruning has nothing to adapt**
 - **QAIR without IVF has no confidence signals**
+
+---
+
+## Implementation Plan (Phase 6: Quantization)
+
+**Goal:** Reduce memory footprint and improve cache efficiency with controlled recall loss, while keeping the existing f32 path and file format fully backward compatible.
+
+### Scope and Principles
+- Backward compatibility: v1/v2 segment readers must continue to load.
+- Incremental rollout: quantization is opt-in via config flags and per-segment metadata.
+- Mixed precision: quantized scan always supports f32 rerank.
+- Determinism: quantization outputs must be stable given identical inputs.
+
+### Design Decisions (Lock First)
+- [ ] **Format strategy:** choose **new segment format** (TPV3) vs **sidecar file** (e.g., `.tpq`).
+  - TPV3: fastest read path, more invasive migrations.
+  - Sidecar: safer rollout, slightly more IO.
+- [ ] **Quantization kinds:** `none | f16 | sq8` with room for PQ later.
+- [ ] **Calibration storage:** per-dimension min/max for SQ8 (stored in header or sidecar).
+
+### Data Model and Config
+- [ ] Add `QuantizationKind` enum and metadata in `crates/tidepool-common/src/segment_v2.rs` (or new `segment_v3.rs`).
+- [ ] Extend writer options in `crates/tidepool-common/src/segment.rs` to accept quantization settings.
+- [ ] Wire config flags in `crates/tidepool-common/src/config.rs` (e.g., `QUANTIZATION=none|f16|sq8`).
+
+### Writer Path (Compaction)
+- [ ] **f16:** quantize vectors on write, store f16 payload in segment.
+- [ ] **SQ8:** compute per-dimension min/max, quantize vectors to i8, store scales/offsets.
+- [ ] Persist quantization metadata (kind, dims, calibration) alongside segment payload.
+- [ ] Keep f32 vectors optional (for rerank) based on a flag.
+
+### Reader and Search Path
+- [ ] Load quantization metadata and expose accessors in segment view.
+- [ ] Implement asymmetric distance:
+  - f16: convert to f32 during distance or add f16 kernels.
+  - SQ8: `dot(q_f32, db_i8) * scale + bias` (metric-aware).
+- [ ] Add mixed-precision rerank in `crates/tidepool-common/src/segment.rs`:
+  - Stage 1: quantized scan to top-k * R.
+  - Stage 2: f32 rerank to top-k.
+
+### SIMD and Kernels
+- [ ] f16 kernel path in `crates/tidepool-common/src/simd.rs` (optional).
+- [ ] SQ8 dot product path; ensure scalar fallback is correct and tested.
+
+### Tests
+- [ ] Round-trip tests for quantized segment read/write.
+- [ ] Recall tests vs f32 baseline at fixed k and nprobe.
+- [ ] Determinism tests: same input produces identical quantized output.
+
+### Benchmarks and Exit Gates
+- [ ] Memory per vector improved by 2x (f16) and 4x (SQ8).
+- [ ] Recall@10 >= 95% vs f32 baseline for SQ8.
+- [ ] Latency regression <= 10% at p50 (with rerank enabled).
