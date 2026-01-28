@@ -4,6 +4,7 @@ pub mod document;
 pub mod index;
 pub mod manifest;
 pub mod segment;
+pub mod segment_v2;
 pub mod storage;
 pub mod tombstone;
 pub mod vector;

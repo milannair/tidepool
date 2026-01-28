@@ -66,6 +66,7 @@ async fn main() {
             hnsw_ef_construction: cfg.hnsw_ef_construction,
             hnsw_ef_search: cfg.hnsw_ef_search,
             metric: tidepool_common::vector::DistanceMetric::Cosine,
+            use_v2_format: true,
         },
     );
 

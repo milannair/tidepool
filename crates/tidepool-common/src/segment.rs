@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use hex::encode as hex_encode;
@@ -15,17 +16,45 @@ use tokio::fs;
 use crate::attributes::AttrValue;
 use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
+use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentView};
 use crate::storage::{segment_index_path, segment_path, Store, StorageError};
 use crate::vector::{distance, DistanceMetric};
 
-#[derive(Debug, Clone)]
+/// Segment data - supports both owned (v1) and zero-copy (v2) modes
+#[derive(Clone)]
 pub struct SegmentData {
+    /// String IDs (owned for v1, lazily loaded for v2)
     pub ids: Vec<String>,
+    /// Vectors - for v1 these are owned, for v2 this is empty and we use raw_data
     pub vectors: Vec<Vec<f32>>,
+    /// Attributes
     pub attributes: Vec<Option<AttrValue>>,
+    /// Vector dimensions
     pub dimensions: usize,
+    /// HNSW index for ANN search
     pub index: Option<HnswIndex>,
+    /// Filter index for attribute queries
     pub filters: Option<FilterIndex>,
+    /// Raw segment data for zero-copy v2 access (kept for lifetime)
+    #[allow(dead_code)]
+    raw_data: Option<Arc<SegmentBytes>>,
+    /// Precomputed norms (for v2, stored in file; for v1, computed here)
+    norms: Vec<f32>,
+    /// Whether this is v2 format
+    #[allow(dead_code)]
+    is_v2: bool,
+}
+
+impl std::fmt::Debug for SegmentData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentData")
+            .field("ids_len", &self.ids.len())
+            .field("vectors_len", &self.vectors.len())
+            .field("dimensions", &self.dimensions)
+            .field("has_index", &self.index.is_some())
+            .field("is_v2", &self.is_v2)
+            .finish()
+    }
 }
 
 /// Internal struct for storing segment attributes.
@@ -43,6 +72,8 @@ pub struct WriterOptions {
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
     pub metric: DistanceMetric,
+    /// Use v2 zero-copy format (default: true)
+    pub use_v2_format: bool,
 }
 
 impl Default for WriterOptions {
@@ -52,6 +83,7 @@ impl Default for WriterOptions {
             hnsw_ef_construction: DEFAULT_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_EF_SEARCH,
             metric: DistanceMetric::Cosine,
+            use_v2_format: true,
         }
     }
 }
@@ -106,6 +138,47 @@ impl<S: Store> Writer<S> {
         }
 
         let segment_id = uuid::Uuid::new_v4().to_string();
+        
+        // Write segment data (v2 or v1 format)
+        let buf = if self.opts.use_v2_format {
+            write_segment_v2(docs)?
+        } else {
+            self.write_segment_v1(docs, dimensions)?
+        };
+
+        // Build HNSW index
+        let mut hnsw = HnswIndex::new(
+            self.opts.hnsw_m,
+            self.opts.hnsw_ef_construction,
+            self.opts.hnsw_ef_search,
+            self.opts.metric,
+        );
+        for (i, doc) in docs.iter().enumerate() {
+            hnsw.insert(i, doc.vector.clone());
+        }
+        let hnsw_data = hnsw
+            .marshal_binary()
+            .map_err(|e| StorageError::Other(format!("serialize HNSW: {}", e)))?;
+
+        let segment_key = segment_path(&self.namespace, &segment_id);
+        self.storage.put(&segment_key, buf).await?;
+
+        let index_key = segment_index_path(&self.namespace, &segment_id);
+        if let Err(err) = self.storage.put(&index_key, hnsw_data).await {
+            let _ = self.storage.delete(&segment_key).await;
+            return Err(err);
+        }
+
+        Ok(Some(ManifestSegment {
+            id: segment_id,
+            segment_key,
+            doc_count: docs.len() as i64,
+            dimensions,
+        }))
+    }
+    
+    /// Write v1 format segment (legacy)
+    fn write_segment_v1(&self, docs: &[Document], dimensions: usize) -> Result<Vec<u8>, StorageError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"TPVS");
         buf.write_u32::<LittleEndian>(1)
@@ -138,36 +211,9 @@ impl<S: Store> Writer<S> {
         let attr_bytes = attr_bytes.as_ref();
         buf.write_u32::<LittleEndian>(attr_bytes.len() as u32)
             .map_err(|e| StorageError::Other(format!("write attr length: {}", e)))?;
-        buf.extend_from_slice(&attr_bytes);
-
-        let mut hnsw = HnswIndex::new(
-            self.opts.hnsw_m,
-            self.opts.hnsw_ef_construction,
-            self.opts.hnsw_ef_search,
-            self.opts.metric,
-        );
-        for (i, doc) in docs.iter().enumerate() {
-            hnsw.insert(i, doc.vector.clone());
-        }
-        let hnsw_data = hnsw
-            .marshal_binary()
-            .map_err(|e| StorageError::Other(format!("serialize HNSW: {}", e)))?;
-
-        let segment_key = segment_path(&self.namespace, &segment_id);
-        self.storage.put(&segment_key, buf).await?;
-
-        let index_key = segment_index_path(&self.namespace, &segment_id);
-        if let Err(err) = self.storage.put(&index_key, hnsw_data).await {
-            let _ = self.storage.delete(&segment_key).await;
-            return Err(err);
-        }
-
-        Ok(Some(ManifestSegment {
-            id: segment_id,
-            segment_key,
-            doc_count: docs.len() as i64,
-            dimensions,
-        }))
+        buf.extend_from_slice(attr_bytes);
+        
+        Ok(buf)
     }
 }
 
@@ -216,6 +262,101 @@ impl<S: Store> Reader<S> {
 
     pub async fn read_segment(&self, segment_key: &str) -> Result<SegmentData, StorageError> {
         let data = self.get_segment_data(segment_key).await?;
+        let bytes = data.as_slice();
+        
+        // Check format version
+        if is_v2_format(bytes) {
+            self.read_segment_v2(segment_key, data).await
+        } else {
+            self.read_segment_v1(segment_key, data).await
+        }
+    }
+    
+    /// Read v2 format segment (zero-copy)
+    async fn read_segment_v2(&self, segment_key: &str, data: SegmentBytes) -> Result<SegmentData, StorageError> {
+        let data = Arc::new(data);
+        let bytes = data.as_slice();
+        
+        // SAFETY: We verify the format and bounds in SegmentView::from_bytes
+        let view = unsafe { SegmentView::from_bytes(bytes)? };
+        
+        let num_vectors = view.len();
+        let dimensions = view.dimensions();
+        
+        // Extract IDs (we need owned strings for the API)
+        let mut ids = Vec::with_capacity(num_vectors);
+        for i in 0..num_vectors {
+            ids.push(view.id_string(i).unwrap_or("").to_string());
+        }
+        
+        // Extract vectors (needed for HNSW which stores references)
+        // TODO: In future, make HNSW work with zero-copy views
+        let mut vectors = Vec::with_capacity(num_vectors);
+        for i in 0..num_vectors {
+            vectors.push(view.vector(i).to_vec());
+        }
+        
+        // Extract norms
+        let mut norms = Vec::with_capacity(num_vectors);
+        for i in 0..num_vectors {
+            norms.push(view.norm(i));
+        }
+        
+        // Extract attributes
+        let (attr_bytes, attr_len) = view.attr_region();
+        let attrs = if attr_len > 0 {
+            // SAFETY: We trust our own serialized format
+            let archived = unsafe { rkyv::archived_root::<Vec<segment_v2::SegmentAttrV2>>(attr_bytes) };
+            let attr_data: Vec<segment_v2::SegmentAttrV2> = archived
+                .deserialize(&mut rkyv::Infallible)
+                .map_err(|e| StorageError::Other(format!("deserialize v2 attributes: {:?}", e)))?;
+            
+            attr_data
+                .into_iter()
+                .map(|a| {
+                    if a.attributes_json.is_empty() {
+                        None
+                    } else {
+                        serde_json::from_slice(&a.attributes_json).ok()
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; num_vectors]
+        };
+        
+        let mut seg = SegmentData {
+            ids,
+            vectors,
+            attributes: attrs,
+            dimensions,
+            index: None,
+            filters: None,
+            raw_data: Some(data),
+            norms,
+            is_v2: true,
+        };
+        
+        // Load HNSW index
+        if let Some(segment_id) = segment_id_from_key(segment_key) {
+            let index_key = segment_index_path(&self.namespace, &segment_id);
+            if self.storage.exists(&index_key).await.unwrap_or(false) {
+                if let Ok(index_data) = self.get_index_data(&index_key).await {
+                    if let Ok(hnsw) =
+                        HnswIndex::load_binary(index_data.as_slice(), &seg.vectors, self.hnsw_ef_search)
+                    {
+                        seg.index = Some(hnsw);
+                    }
+                }
+            }
+        }
+        
+        seg.filters = build_filter_index(&seg.attributes);
+        Ok(seg)
+    }
+    
+    /// Read v1 format segment (legacy)
+    async fn read_segment_v1(&self, segment_key: &str, data: SegmentBytes) -> Result<SegmentData, StorageError> {
         let mut cursor = std::io::Cursor::new(data.as_slice());
         let mut magic = [0u8; 4];
         cursor
@@ -241,6 +382,7 @@ impl<S: Store> Reader<S> {
         }
 
         let mut vectors = Vec::with_capacity(num_vectors);
+        let mut norms = Vec::with_capacity(num_vectors);
         for _ in 0..num_vectors {
             let mut vec = Vec::with_capacity(dimensions);
             for _ in 0..dimensions {
@@ -249,6 +391,7 @@ impl<S: Store> Reader<S> {
                     .map_err(|e| StorageError::Other(format!("read vector: {}", e)))?;
                 vec.push(v);
             }
+            norms.push(compute_norm(&vec));
             vectors.push(vec);
         }
 
@@ -295,6 +438,9 @@ impl<S: Store> Reader<S> {
             dimensions,
             index: None,
             filters: None,
+            raw_data: None,
+            norms,
+            is_v2: false,
         };
 
         if let Some(segment_id) = segment_id_from_key(segment_key) {
@@ -407,13 +553,24 @@ fn cache_key_prefix(key: &str) -> String {
     hex[..16].to_string()
 }
 
-enum SegmentBytes {
+/// Segment data storage - either owned or memory-mapped
+pub enum SegmentBytes {
     Owned(Vec<u8>),
     Mapped(Mmap),
 }
 
+impl Clone for SegmentBytes {
+    fn clone(&self) -> Self {
+        match self {
+            SegmentBytes::Owned(buf) => SegmentBytes::Owned(buf.clone()),
+            // For Mmap, we just clone the data (mmap cannot be cloned)
+            SegmentBytes::Mapped(mmap) => SegmentBytes::Owned(mmap.to_vec()),
+        }
+    }
+}
+
 impl SegmentBytes {
-    fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         match self {
             SegmentBytes::Owned(buf) => buf.as_slice(),
             SegmentBytes::Mapped(mmap) => mmap,
@@ -428,6 +585,34 @@ pub struct ScoredResult {
 }
 
 impl SegmentData {
+    /// Get the number of vectors
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.vectors.len()
+    }
+    
+    /// Check if empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty()
+    }
+    
+    /// Get vector by index
+    #[inline]
+    pub fn vector(&self, index: usize) -> &[f32] {
+        &self.vectors[index]
+    }
+    
+    /// Get precomputed norm for vector
+    #[inline]
+    pub fn norm(&self, index: usize) -> f32 {
+        if index < self.norms.len() {
+            self.norms[index]
+        } else {
+            compute_norm(&self.vectors[index])
+        }
+    }
+    
     pub fn search(
         &self,
         query: &[f32],
@@ -476,6 +661,13 @@ impl SegmentData {
         allowed: Option<&RoaringBitmap>,
     ) -> Vec<ScoredResult> {
         let mut results = Vec::new();
+        
+        // Precompute query norm for cosine distance
+        let query_norm = if metric == DistanceMetric::Cosine {
+            compute_norm(query)
+        } else {
+            0.0
+        };
 
         if let Some(bitmap) = allowed {
             for idx in bitmap.iter() {
@@ -488,17 +680,17 @@ impl SegmentData {
                         continue;
                     }
                 }
-                let dist = distance(query, &self.vectors[idx], metric);
+                let dist = self.distance_to(idx, query, query_norm, metric);
                 results.push(ScoredResult { index: idx, dist });
             }
         } else {
-            for (idx, vec) in self.vectors.iter().enumerate() {
+            for idx in 0..self.vectors.len() {
                 if let Some(f) = filters {
                     if !matches_filters(self.attributes.get(idx).and_then(|v| v.as_ref()), f) {
                         continue;
                     }
                 }
-                let dist = distance(query, vec, metric);
+                let dist = self.distance_to(idx, query, query_norm, metric);
                 results.push(ScoredResult { index: idx, dist });
             }
         }
@@ -509,6 +701,39 @@ impl SegmentData {
         }
         results
     }
+    
+    /// Compute distance with precomputed norms (optimized for cosine)
+    #[inline]
+    fn distance_to(&self, index: usize, query: &[f32], query_norm: f32, metric: DistanceMetric) -> f32 {
+        let vec = &self.vectors[index];
+        match metric {
+            DistanceMetric::Cosine => {
+                // cosine_distance = 1 - (a·b)/(||a||*||b||)
+                let vec_norm = self.norm(index);
+                if vec_norm == 0.0 || query_norm == 0.0 {
+                    return 2.0;
+                }
+                let dot = dot_product_fast(query, vec);
+                1.0 - dot / (query_norm * vec_norm)
+            }
+            DistanceMetric::Euclidean => {
+                distance(query, vec, metric)
+            }
+            DistanceMetric::DotProduct => {
+                -dot_product_fast(query, vec)
+            }
+        }
+    }
+}
+
+/// Fast dot product
+#[inline]
+fn dot_product_fast(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        sum += (*x as f64) * (*y as f64);
+    }
+    sum as f32
 }
 
 #[derive(Debug, Clone)]
