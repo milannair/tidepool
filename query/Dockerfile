@@ -1,7 +1,3 @@
-# Dockerfile for tidepool-ingest service
-# Multi-stage build for minimal final image
-
-# Build stage
 FROM golang:1.23-alpine AS builder
 
 # Install git for go mod download (some deps may need it)
@@ -19,14 +15,14 @@ COPY . .
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s" \
-    -o tidepool-ingest \
-    ./cmd/tidepool-ingest
+    -o tidepool-query \
+    ./query/cmd/query
 
 # Final stage - distroless for minimal attack surface
 FROM gcr.io/distroless/static:nonroot
 
 # Copy the binary
-COPY --from=builder /build/tidepool-ingest /tidepool-ingest
+COPY --from=builder /build/tidepool-query /tidepool-query
 
 # Copy CA certificates for HTTPS
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
@@ -39,4 +35,4 @@ USER nonroot:nonroot
 
 EXPOSE 8080
 
-ENTRYPOINT ["/tidepool-ingest"]
+ENTRYPOINT ["/tidepool-query"]

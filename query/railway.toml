@@ -2,13 +2,14 @@
 
 [build]
 builder = "dockerfile"
-dockerfilePath = "/Dockerfile.query"
+dockerfilePath = "query/Dockerfile"
 watchPatterns = [
-  "cmd/tidepool-query/**",
+  "query/cmd/query/**",
+  "query/internal/**",
   "internal/**",
   "go.mod",
   "go.sum",
-  "Dockerfile.query"
+  "query/Dockerfile"
 ]
 
 [deploy]

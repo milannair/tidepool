@@ -2,13 +2,14 @@
 
 [build]
 builder = "dockerfile"
-dockerfilePath = "/Dockerfile.ingest"
+dockerfilePath = "ingest/Dockerfile"
 watchPatterns = [
-  "cmd/tidepool-ingest/**",
+  "ingest/cmd/ingest/**",
+  "ingest/internal/**",
   "internal/**",
   "go.mod",
   "go.sum",
-  "Dockerfile.ingest"
+  "ingest/Dockerfile"
 ]
 
 [deploy]

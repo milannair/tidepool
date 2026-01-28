@@ -200,10 +200,10 @@ export BUCKET_NAME=tidepool
 
 ```bash
 # Terminal 1 - Query
-go run ./cmd/tidepool-query
+go run ./query/cmd/query
 
 # Terminal 2 - Ingest
-go run ./cmd/tidepool-ingest
+go run ./ingest/cmd/ingest
 ```
 
 ### Example Usage
@@ -241,18 +241,17 @@ This repo is set up for a Railway template with **two services**:
 ### Template Setup
 
 1. Create a new Railway project from this repo.
-2. Add two services and point each to its config file:
-   - **tidepool-query** → `services/query/railway.toml`
-   - **tidepool-ingest** → `services/ingest/railway.toml`
-3. In Railway service settings, set **Root Directory** for both services to `/` (repo root).
-3. Add a Railway Object Storage (S3-compatible bucket).
-4. Add the bucket env vars to both services (see below).
-5. Optional: add a volume at `/data` for query caching.
+2. Add two services and point each to its config file (absolute paths). citeturn2search1turn2search2
+   - **tidepool-query** → `/query/railway.toml`
+   - **tidepool-ingest** → `/ingest/railway.toml`
+3. Set **Root Directory** for both services to `/` (repo root). citeturn2search3
+4. Add a Railway Object Storage (S3-compatible bucket).
+5. Add the bucket env vars to both services (see below).
+6. Optional: add a volume at `/data` for query caching.
 
-### Troubleshooting
-
-If the build fails with `stat /build/cmd/tidepool-query: directory not found`, the
-service Root Directory is not set to the repo root. Update it to `/` and redeploy.
+Note: Railway config-as-code (`railway.toml`/`railway.json`) applies to a single
+service deployment, while multi-service templates are created from a Railway
+project in the UI. See `TEMPLATE.md` for the exact steps. citeturn2search2turn3search0
 
 ### Railway Environment Variables
 

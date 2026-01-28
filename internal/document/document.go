@@ -36,8 +36,8 @@ type QueryResponse struct {
 
 // UpsertRequest represents a request to upsert vectors.
 type UpsertRequest struct {
-	Vectors      []Document `json:"vectors"`
-	DistanceMetric string   `json:"distance_metric,omitempty"`
+	Vectors        []Document `json:"vectors"`
+	DistanceMetric string     `json:"distance_metric,omitempty"`
 }
 
 // UpsertResponse represents the response from an upsert request.
@@ -57,7 +57,7 @@ type DeleteResponse struct {
 
 // NamespaceInfo contains information about a namespace.
 type NamespaceInfo struct {
-	Namespace    string `json:"namespace"`
-	ApproxCount  int64  `json:"approx_count"`
-	Dimensions   int    `json:"dimensions"`
+	Namespace   string `json:"namespace"`
+	ApproxCount int64  `json:"approx_count"`
+	Dimensions  int    `json:"dimensions"`
 }

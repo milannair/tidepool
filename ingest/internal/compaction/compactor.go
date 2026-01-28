@@ -8,11 +8,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/tidepool/tidepool/ingest/internal/wal"
 	"github.com/tidepool/tidepool/internal/document"
 	"github.com/tidepool/tidepool/internal/manifest"
 	"github.com/tidepool/tidepool/internal/segment"
 	"github.com/tidepool/tidepool/internal/storage"
-	"github.com/tidepool/tidepool/internal/wal"
 )
 
 // Compactor compacts WAL files into segments.
