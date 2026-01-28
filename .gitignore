@@ -18,6 +18,7 @@ go.work
 
 # Dependency directories
 vendor/
+target/
 
 # IDE
 .idea/

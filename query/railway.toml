@@ -4,11 +4,10 @@
 builder = "dockerfile"
 dockerfilePath = "query/Dockerfile"
 watchPatterns = [
-  "query/cmd/query/**",
-  "query/internal/**",
-  "internal/**",
-  "go.mod",
-  "go.sum",
+  "query/src/**",
+  "crates/**",
+  "Cargo.toml",
+  "Cargo.lock",
   "query/Dockerfile"
 ]
 

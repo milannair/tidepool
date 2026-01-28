@@ -31,6 +31,7 @@ namespaces/{namespace}/
     {date}/{uuid}.jsonl  # Write-ahead log
   segments/
     {segment_id}.tpvs    # Vector segments
+    {segment_id}.hnsw    # HNSW index graph
 ```
 
 ## API Reference
@@ -45,6 +46,7 @@ Query vectors by similarity.
 {
   "vector": [0.1, 0.2, 0.3, ...],
   "top_k": 10,
+  "ef_search": 100,
   "distance_metric": "cosine_distance",
   "include_vectors": false,
   "filters": {
@@ -160,12 +162,15 @@ Health check.
 | `MAX_BODY_BYTES` | No | `26214400` | Max request body size in bytes |
 | `MAX_TOP_K` | No | `1000` | Max top_k for queries |
 | `CORS_ALLOW_ORIGIN` | No | `*` | CORS allow origin |
+| `HNSW_M` | No | `16` | HNSW max connections per node |
+| `HNSW_EF_CONSTRUCTION` | No | `200` | HNSW build-time beam width |
+| `HNSW_EF_SEARCH` | No | `100` | HNSW query-time beam width |
 
 ## Development
 
 ### Prerequisites
 
-- Go 1.23+
+- Rust 1.93+
 - Docker (optional)
 - S3-compatible storage (MinIO for local dev)
 
@@ -200,10 +205,17 @@ export BUCKET_NAME=tidepool
 
 ```bash
 # Terminal 1 - Query
-go run ./query/cmd/query
+cargo run -p tidepool-query
 
 # Terminal 2 - Ingest
-go run ./ingest/cmd/ingest
+cargo run -p tidepool-ingest
+```
+
+### Benchmarks & Recall
+
+```bash
+# HNSW search benchmarks + recall sanity checks
+cargo bench -p tidepool-common --bench hnsw
 ```
 
 ### Example Usage
@@ -253,7 +265,7 @@ Note: Railway config-as-code (`railway.toml`/`railway.json`) applies to a single
 service deployment, while multi-service templates are created from a Railway
 project in the UI. See `TEMPLATE.md` for the exact steps.
 
-If a build uses Railpack and fails with `no Go files in /app`, the service is not
+If a build uses Railpack and fails with `no Rust files in /app`, the service is not
 using the Dockerfile builder. In Railway, set the service **Builder** to
 Dockerfile or add the env var `RAILWAY_DOCKERFILE_PATH` (already set in the
 service `railway.toml`).

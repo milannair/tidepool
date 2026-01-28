@@ -1,0 +1,3 @@
+[workspace]
+members = ["ingest", "query", "crates/tidepool-common"]
+resolver = "2"

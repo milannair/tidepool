@@ -31,6 +31,6 @@ the UI rather than fully defined in `railway.json`/`railway.toml`.
 
 - If you see `stat /build/cmd/...: directory not found`, the service Root Directory
   is not set to `/` and the build context doesn’t include the repo root.
-- If you see `no Go files in /app`, the service is using Railpack instead of the
+- If you see `no Rust files in /app`, the service is using Railpack instead of the
   Dockerfile builder. Switch the builder to Dockerfile or rely on the
   `RAILWAY_DOCKERFILE_PATH` env var.
