@@ -4,13 +4,17 @@ A high-performance vector database designed for cost-effective deployment on clo
 
 ## Features
 
-- **Hybrid Indexing** - HNSW for small segments, IVF with k-means clustering for large segments
+- **Hybrid Search** - Combine vector similarity and BM25 full-text search with configurable fusion
+- **Full-Text Search** - BM25 ranking with stemming, stopwords, and configurable tokenization
+- **Vector Indexing** - HNSW for small segments, IVF with k-means clustering for large segments
 - **Vector Quantization** - SQ8 (4× compression) and f16 (2× compression) with asymmetric search
 - **SIMD Acceleration** - AVX2/FMA on x86_64, NEON on ARM64, with automatic runtime detection
 - **Zero-Copy Access** - Memory-mapped segments eliminate deserialization overhead
+- **Real-Time Updates** - Sub-second write-to-query latency via WAL-aware hot buffer
+- **Dynamic Namespaces** - Multi-tenant support with LRU eviction and namespace isolation
 - **Attribute Filtering** - Filter search results by metadata attributes
-- **S3-Compatible** - Works with AWS S3, Cloudflare R2, MinIO, and other S3-compatible storage
-- **Stateless Architecture** - Query and ingest services scale independently
+- **S3-Only Architecture** - No Redis, no distributed consensus—just object storage
+- **Stateless Services** - Query and ingest services scale horizontally
 
 ## Quick Start
 
@@ -18,18 +22,30 @@ A high-performance vector database designed for cost-effective deployment on clo
 # Start services with Docker Compose (includes MinIO for local S3)
 docker-compose up -d
 
-# Insert vectors (ingest service on port 8081)
+# Insert vectors with text (ingest service on port 8081)
 curl -X POST http://localhost:8081/v1/vectors/default \
   -H "Content-Type: application/json" \
-  -d '{"vectors": [{"id": "1", "vector": [0.1, 0.2, 0.3], "attributes": {"title": "Example"}}]}'
+  -d '{
+    "vectors": [
+      {"id": "1", "vector": [0.1, 0.2, 0.3], "text": "Machine learning guide", "attributes": {"title": "ML Doc"}},
+      {"id": "2", "vector": [0.4, 0.5, 0.6], "text": "Deep neural networks", "attributes": {"title": "DL Doc"}}
+    ]
+  }'
 
-# Trigger compaction (or wait for automatic compaction)
-curl -X POST http://localhost:8081/v1/namespaces/default/compact
-
-# Query vectors (query service on port 8080)
+# Vector search (query service on port 8080)
 curl -X POST http://localhost:8080/v1/vectors/default \
   -H "Content-Type: application/json" \
   -d '{"vector": [0.1, 0.2, 0.3], "top_k": 10}'
+
+# Full-text search (BM25)
+curl -X POST http://localhost:8080/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{"text": "machine learning", "mode": "text", "top_k": 10}'
+
+# Hybrid search (vector + text)
+curl -X POST http://localhost:8080/v1/vectors/default \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, 0.3], "text": "neural networks", "mode": "hybrid", "alpha": 0.7, "top_k": 10}'
 ```
 
 ## Architecture
@@ -56,15 +72,60 @@ namespaces/{namespace}/
     latest.json          # Current state
     {version}.json       # Versioned snapshots
   wal/
-    {date}/{uuid}.wal    # Write-ahead log
+    {date}/{uuid}.wal    # Write-ahead log (vectors + text)
   segments/
     {segment_id}.tpvs    # Vector segments (TPV2 binary format)
     {segment_id}.hnsw    # HNSW index graph
     {segment_id}.ivf     # IVF centroid index (for large segments)
     {segment_id}.tpq     # Quantized vectors sidecar (SQ8/f16)
+    {segment_id}.tpti    # Text index (BM25 inverted index)
   tombstones/
     latest.rkyv          # Deleted IDs
 ```
+
+## Search Modes
+
+Tidepool supports three search modes that can be selected via the `mode` parameter:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `vector` | Pure vector similarity search | Semantic search, embeddings |
+| `text` | BM25 full-text search | Keyword matching, exact terms |
+| `hybrid` | Combined vector + text | Best of both worlds |
+
+### Hybrid Search Fusion
+
+When using `mode: "hybrid"`, you can choose between two fusion strategies via the `fusion` parameter:
+
+**Blend (default)** - Linear combination of normalized scores:
+```
+final_score = alpha × vector_score + (1 - alpha) × text_score
+```
+
+| Alpha | Behavior |
+|-------|----------|
+| `1.0` | 100% vector (same as `mode: "vector"`) |
+| `0.7` | 70% vector, 30% text (default) |
+| `0.5` | Equal weight |
+| `0.0` | 100% text (same as `mode: "text"`) |
+
+**RRF (Reciprocal Rank Fusion)** - Rank-based fusion that's robust to score distribution differences:
+```
+rrf_score = 1/(rrf_k + vector_rank) + 1/(rrf_k + text_rank)
+```
+
+Use `"fusion": "rrf"` with `"rrf_k": 60` (default) for datasets where vector and text scores have very different distributions.
+
+### BM25 Configuration
+
+The text search uses BM25 ranking with configurable parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `BM25_K1` | 1.2 | Term saturation (higher = more weight to term frequency) |
+| `BM25_B` | 0.75 | Length normalization (0 = no penalty, 1 = full penalty) |
+| `TEXT_ENABLE_STEMMING` | true | Apply Porter stemming (e.g., "running" → "run") |
+| `TEXT_LANGUAGE` | english | Stemming rules language |
 
 ## Performance
 
@@ -83,11 +144,21 @@ namespaces/{namespace}/
 
 Approximate resource usage with SQ8 quantization (default):
 
-| Vector Count | Dimensions | Disk Usage | Query RAM |
-|--------------|------------|------------|-----------|
-| 100,000 | 768 | ~100 MB | ~50 MB |
-| 1,000,000 | 768 | ~1 GB | ~500 MB |
-| 3,000,000 | 768 | ~3 GB | ~1.5 GB |
+| Vector Count | Dimensions | S3 Storage | Query RAM | Use Case |
+|--------------|------------|------------|-----------|----------|
+| 100,000 | 768 | ~100 MB | ~50 MB | Small apps |
+| 100,000 | 1536 | ~200 MB | ~100 MB | OpenAI ada-002 |
+| 1,000,000 | 768 | ~1 GB | ~500 MB | Production |
+| 1,000,000 | 1536 | ~2 GB | ~1 GB | Production |
+| 10,000,000 | 1536 | ~22 GB | ~8 GB | Enterprise |
+
+### Full-Text Index Overhead
+
+| Documents | Avg Vocabulary | Text Index Size |
+|-----------|----------------|-----------------|
+| 100,000 | ~50K terms | ~20-50 MB |
+| 1,000,000 | ~200K terms | ~200-500 MB |
+| 10,000,000 | ~500K terms | ~2-5 GB |
 
 ### SIMD Optimization
 
@@ -421,25 +492,29 @@ If the build fails with `no Rust files in /app`, ensure the service is configure
 
 ### Write Path (Ingest Service)
 
-1. **Upsert**: Vectors written to WAL files in S3 (immediate durability)
-2. **Compaction** (background, every 5min by default):
+1. **Upsert**: Vectors + text written to WAL files in S3 (immediate durability)
+2. **Real-time**: WAL entries available for query via hot buffer (sub-second)
+3. **Compaction** (background, every 5min by default):
    - Reads WAL entries
-   - Builds segment file (`.tpvs`) with 32-byte aligned vectors
+   - Builds segment file (`.tpvs`) with 32-byte aligned vectors + stored text
    - Builds HNSW index (`.hnsw`) for small segments
    - Builds IVF index (`.ivf`) + quantized vectors (`.tpq`) for large segments
+   - Builds BM25 text index (`.tpti`) for full-text search
    - Updates manifest
    - Deletes processed WAL files
-3. **Delete**: Tombstones written to WAL, filtered out during queries
+4. **Delete**: Tombstones written to WAL, filtered out during queries
 
 ### Read Path (Query Service)
 
 1. **Load manifest** from S3 (lists active segments)
-2. **Fetch segments** from S3 → local cache (mmap for zero-copy)
-3. **Search** each segment in parallel:
-   - Small segment: HNSW graph traversal
-   - Large segment: IVF centroid routing → quantized scan → f32 rerank
-4. **Merge** results across segments, apply tombstones
-5. **Return** top-k results
+2. **Scan WAL** for recent upserts/deletes not yet compacted (hot buffer)
+3. **Fetch segments** from S3 → local cache (mmap for zero-copy)
+4. **Search** each segment in parallel:
+   - Vector search: HNSW (small) or IVF (large) with optional quantization
+   - Text search: BM25 inverted index lookup
+   - Hybrid: Both, then fuse scores
+5. **Merge** results from hot buffer + segments, apply tombstones
+6. **Return** top-k results with normalized scores (0-1, higher = better)
 
 ### Architecture Benefits
 
@@ -448,11 +523,26 @@ If the build fails with `no Rust files in /app`, ensure the service is configure
 - **Horizontal Scaling**: Add query instances that share the same S3 data
 - **Operational Simplicity**: No distributed consensus or leader election
 
+## Capacity Guidelines
+
+| Deployment | Vectors | Query RAM | S3 Storage | Recommended |
+|------------|---------|-----------|------------|-------------|
+| Small | 100K | 512 MB | 500 MB | Prototypes, small apps |
+| Medium | 1M | 2-4 GB | 5 GB | Production workloads |
+| Large | 10M | 8-16 GB | 50 GB | Enterprise search |
+| X-Large | 100M+ | 32 GB+ | 500 GB+ | Large-scale RAG |
+
+**Scaling tips:**
+- Increase `HOT_BUFFER_MAX_SIZE` for high write throughput
+- Add query replicas for read scaling (all stateless, read from same S3)
+- Use `NAMESPACE` to lock single-tenant deployments for lower memory
+- Attach volume at `/data` for segment caching (reduces S3 reads)
+
 ## Current Limitations
 
-- Dynamic namespaces supported (set `NAMESPACE` to lock to one)
-- Eventual consistency model (vectors become queryable after compaction)
 - No cursor-based pagination for result sets exceeding `top_k`
+- Text search requires documents to have `text` field populated
+- Hybrid search requires both `vector` and `text` in documents for best results
 
 ## License
 
