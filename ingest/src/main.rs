@@ -166,13 +166,13 @@ async fn upsert(
         return json_error(StatusCode::BAD_REQUEST, "vectors are required");
     }
 
-    match state.wal_writer.write_upsert(req.vectors).await {
-        Ok(_) => Json(UpsertResponse { status: "ok".to_string() }).into_response(),
-        Err(err) => {
-            error!("Upsert error: {}", err);
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "upsert failed")
-        }
+    // Write to WAL for durability (query nodes will scan WAL for real-time visibility)
+    if let Err(err) = state.wal_writer.write_upsert(req.vectors.clone()).await {
+        error!("Upsert error: {}", err);
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "upsert failed");
     }
+
+    Json(UpsertResponse { status: "ok".to_string() }).into_response()
 }
 
 async fn delete_vectors(
@@ -188,13 +188,13 @@ async fn delete_vectors(
         return json_error(StatusCode::BAD_REQUEST, "ids are required");
     }
 
-    match state.wal_writer.write_delete(req.ids).await {
-        Ok(_) => Json(DeleteResponse { status: "ok".to_string() }).into_response(),
-        Err(err) => {
-            error!("Delete error: {}", err);
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "delete failed")
-        }
+    // Write to WAL for durability (query nodes will scan WAL for real-time visibility)
+    if let Err(err) = state.wal_writer.write_delete(req.ids.clone()).await {
+        error!("Delete error: {}", err);
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "delete failed");
     }
+
+    Json(DeleteResponse { status: "ok".to_string() }).into_response()
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {

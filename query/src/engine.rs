@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{info, warn};
 
 use tidepool_common::document::{QueryRequest, QueryResponse, VectorResult};
 use tidepool_common::manifest::{Manifest, Manager};
@@ -11,16 +11,25 @@ use tidepool_common::segment::{Reader, ReaderOptions, SegmentData};
 use tidepool_common::storage::{segment_index_path, segment_ivf_path, segment_quant_path, Store};
 use tidepool_common::tombstone::Manager as TombstoneManager;
 use tidepool_common::vector::DistanceMetric;
+use tidepool_common::wal::Reader as WalReader;
+
+use crate::buffer::HotBuffer;
 
 pub struct Engine<S: Store + Clone> {
+    #[allow(dead_code)]
+    storage: S,
     namespace: String,
     manifest_manager: Manager<S>,
     segment_reader: Reader<S>,
     tombstone_manager: TombstoneManager<S>,
+    wal_reader: WalReader<S>,
     current_manifest: RwLock<Option<Manifest>>,
     loaded_segments: RwLock<HashMap<String, Arc<SegmentData>>>,
     tombstones: RwLock<HashSet<String>>,
     id_versions: RwLock<HashMap<String, usize>>,
+    hot_buffer: Option<Arc<HotBuffer>>,
+    /// Track which WAL files have been scanned
+    scanned_wal_files: RwLock<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +58,16 @@ impl<S: Store + Clone + 'static> Engine<S> {
         cache_dir: Option<String>,
         opts: EngineOptions,
     ) -> Self {
+        Self::new_with_buffer(storage, namespace, cache_dir, opts, None)
+    }
+
+    pub fn new_with_buffer(
+        storage: S,
+        namespace: impl Into<String>,
+        cache_dir: Option<String>,
+        opts: EngineOptions,
+        hot_buffer: Option<Arc<HotBuffer>>,
+    ) -> Self {
         let namespace = namespace.into();
         let manifest_manager = Manager::new(storage.clone(), &namespace);
         let segment_reader = Reader::new_with_options(
@@ -60,17 +79,27 @@ impl<S: Store + Clone + 'static> Engine<S> {
                 quantization_rerank_factor: opts.quantization_rerank_factor,
             },
         );
+        let wal_reader = WalReader::new(storage.clone(), &namespace);
 
         Self {
+            storage: storage.clone(),
             tombstone_manager: TombstoneManager::new(storage, &namespace),
             namespace,
             manifest_manager,
             segment_reader,
+            wal_reader,
             current_manifest: RwLock::new(None),
             loaded_segments: RwLock::new(HashMap::new()),
             tombstones: RwLock::new(HashSet::new()),
             id_versions: RwLock::new(HashMap::new()),
+            hot_buffer,
+            scanned_wal_files: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Get a reference to the hot buffer if available.
+    pub fn hot_buffer(&self) -> Option<&Arc<HotBuffer>> {
+        self.hot_buffer.as_ref()
     }
 
     pub async fn load_manifest(&self) -> Result<bool, String> {
@@ -170,6 +199,118 @@ impl<S: Store + Clone + 'static> Engine<S> {
         *guard = id_versions;
     }
 
+    /// Scan WAL files from S3 and populate the hot buffer.
+    /// Only scans files newer than the current manifest (not yet compacted).
+    async fn scan_wal(&self) {
+        let Some(buffer) = &self.hot_buffer else {
+            return;
+        };
+
+        // Get manifest watermark (files created before this are already in segments)
+        let manifest_created_at = {
+            let manifest = self.current_manifest.read().await;
+            manifest.as_ref().map(|m| m.created_at).unwrap_or(0)
+        };
+
+        // List all WAL files
+        let wal_files = match self.wal_reader.list_wal_files().await {
+            Ok(files) => files,
+            Err(err) => {
+                warn!("Failed to list WAL files: {}", err);
+                return;
+            }
+        };
+
+        // Filter to unscanned files
+        let scanned = self.scanned_wal_files.read().await;
+        let new_files: Vec<_> = wal_files
+            .into_iter()
+            .filter(|f| !scanned.contains(f))
+            .collect();
+        drop(scanned);
+
+        if new_files.is_empty() {
+            return;
+        }
+
+        // Read new WAL files and extract entries
+        let mut docs_to_insert = Vec::new();
+        let mut ids_to_delete = Vec::new();
+        let mut successfully_scanned = Vec::new();
+
+        for wal_file in new_files {
+            match self.wal_reader.read_wal_file(&wal_file).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        // Only process entries newer than manifest
+                        if entry.ts <= manifest_created_at {
+                            continue;
+                        }
+
+                        match entry.op.as_str() {
+                            "upsert" => {
+                                if let Some(doc) = entry.doc {
+                                    docs_to_insert.push(doc);
+                                }
+                            }
+                            "delete" => {
+                                ids_to_delete.extend(entry.delete_ids);
+                            }
+                            _ => {}
+                        }
+                    }
+                    successfully_scanned.push(wal_file);
+                }
+                Err(err) => {
+                    warn!("Failed to read WAL file: {}", err);
+                }
+            }
+        }
+
+        // Update buffer
+        if !docs_to_insert.is_empty() {
+            let count = docs_to_insert.len();
+            buffer.insert(docs_to_insert).await;
+            info!("WAL scan: loaded {} vectors into hot buffer", count);
+        }
+
+        if !ids_to_delete.is_empty() {
+            let count = ids_to_delete.len();
+            buffer.delete(ids_to_delete).await;
+            info!("WAL scan: applied {} deletes to hot buffer", count);
+        }
+
+        // Mark files as scanned
+        let mut scanned = self.scanned_wal_files.write().await;
+        for file in successfully_scanned {
+            scanned.insert(file);
+        }
+    }
+
+    /// Clear scanned WAL files that have been compacted.
+    /// Called when manifest changes to avoid growing the set indefinitely.
+    async fn clear_compacted_wal_files(&self) {
+        let wal_files = match self.wal_reader.list_wal_files().await {
+            Ok(files) => files.into_iter().collect::<HashSet<_>>(),
+            Err(_) => return,
+        };
+
+        // Remove entries for WAL files that no longer exist (were compacted/deleted)
+        let mut scanned = self.scanned_wal_files.write().await;
+        scanned.retain(|f| wal_files.contains(f));
+
+        // Clear buffer when manifest changes (compacted data now in segments)
+        if let Some(buffer) = &self.hot_buffer {
+            // Get new manifest version as u64
+            let manifest = self.current_manifest.read().await;
+            if let Some(m) = manifest.as_ref() {
+                if let Ok(version) = m.version.parse::<u64>() {
+                    buffer.clear_compacted(version).await;
+                }
+            }
+        }
+    }
+
     async fn refresh_state(&self) {
         let changed = self.load_manifest().await.unwrap_or(false);
         if changed {
@@ -187,6 +328,8 @@ impl<S: Store + Clone + 'static> Engine<S> {
                     info!("Cache cleanup: removed {} stale files", removed);
                 }
             }
+            // Clear WAL tracking when manifest changes (data now in segments)
+            self.clear_compacted_wal_files().await;
         }
         let _ = self.ensure_segments_loaded().await;
         if changed || self.id_versions.read().await.is_empty() {
@@ -195,29 +338,49 @@ impl<S: Store + Clone + 'static> Engine<S> {
                 self.rebuild_id_versions(&manifest).await;
             }
         }
+
+        // Scan WAL for recent writes (provides real-time visibility)
+        self.scan_wal().await;
     }
 
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, String> {
         self.refresh_state().await;
 
-        let manifest = { self.current_manifest.read().await.clone() };
-        if manifest.is_none() {
-            return Ok(QueryResponse {
-                results: Vec::new(),
-                namespace: self.namespace.clone(),
-            });
-        }
-        let manifest = manifest.unwrap();
-
-        if manifest.segments.is_empty() {
-            return Ok(QueryResponse {
-                results: Vec::new(),
-                namespace: self.namespace.clone(),
-            });
-        }
-
         let top_k = if req.top_k == 0 { 10 } else { req.top_k };
         let metric = DistanceMetric::parse(req.distance_metric.as_deref());
+
+        // Search hot buffer first (if available)
+        let buffer_results = if let Some(buffer) = &self.hot_buffer {
+            buffer.search(&req.vector, top_k * 2, metric).await
+        } else {
+            Vec::new()
+        };
+
+        // Get buffer tombstones
+        let buffer_deleted = if let Some(buffer) = &self.hot_buffer {
+            buffer.get_deleted_ids().await
+        } else {
+            HashSet::new()
+        };
+
+        // Get IDs in buffer (for deduplication with segments)
+        let buffer_ids: HashSet<String> = buffer_results.iter().map(|r| r.id.clone()).collect();
+
+        let manifest = { self.current_manifest.read().await.clone() };
+        
+        // If no manifest or segments, return buffer results only
+        let manifest = match manifest {
+            Some(m) if !m.segments.is_empty() => m,
+            _ => {
+                let mut results = buffer_results;
+                results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(top_k);
+                return Ok(QueryResponse {
+                    results,
+                    namespace: self.namespace.clone(),
+                });
+            }
+        };
 
         let segments = { self.loaded_segments.read().await.clone() };
         let per_segment_k = top_k.saturating_mul(2).max(top_k + 10);
@@ -265,11 +428,27 @@ impl<S: Store + Clone + 'static> Engine<S> {
         let tombstones = self.tombstones.read().await;
         let id_versions = self.id_versions.read().await;
         let mut all_results = Vec::new();
+        
+        // Add segment results, filtering out:
+        // - Tombstoned IDs (from S3 tombstones)
+        // - IDs deleted in buffer
+        // - IDs that exist in buffer (buffer version is fresher)
+        // - Duplicate IDs from older segments
         for (seg_index, mut results) in segment_results {
             results.retain(|r| {
+                // Skip if in S3 tombstones
                 if tombstones.contains(&r.id) {
                     return false;
                 }
+                // Skip if deleted in buffer
+                if buffer_deleted.contains(&r.id) {
+                    return false;
+                }
+                // Skip if exists in buffer (buffer has fresher version)
+                if buffer_ids.contains(&r.id) {
+                    return false;
+                }
+                // Skip if not latest segment version
                 match id_versions.get(&r.id) {
                     Some(&latest) => latest == seg_index,
                     None => true,
@@ -278,7 +457,11 @@ impl<S: Store + Clone + 'static> Engine<S> {
             all_results.extend(results);
         }
 
-        all_results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        // Add buffer results (already filtered for buffer tombstones)
+        all_results.extend(buffer_results);
+
+        // Sort and truncate
+        all_results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
         if all_results.len() > top_k {
             all_results.truncate(top_k);
         }
@@ -299,6 +482,15 @@ impl<S: Store + Clone + 'static> Engine<S> {
         let segments = self.loaded_segments.read().await;
         let tombstones = self.tombstones.read().await;
         let id_versions = self.id_versions.read().await;
+        
+        // Get buffer stats
+        let (buffer_vectors, buffer_deleted) = if let Some(buffer) = &self.hot_buffer {
+            let stats = buffer.stats().await;
+            (stats.vector_count, stats.deleted_count)
+        } else {
+            (0, 0)
+        };
+
         let mut stats = Stats {
             namespace: self.namespace.clone(),
             manifest_version: None,
@@ -306,6 +498,8 @@ impl<S: Store + Clone + 'static> Engine<S> {
             total_vectors: 0,
             dimensions: 0,
             loaded_segments: segments.len(),
+            buffer_vectors,
+            buffer_deleted,
         };
         if let Some(manifest) = manifest.as_ref() {
             stats.manifest_version = Some(manifest.version.clone());
@@ -316,7 +510,17 @@ impl<S: Store + Clone + 'static> Engine<S> {
             } else {
                 stats.total_vectors = manifest.total_doc_count().saturating_sub(tombstones.len() as i64);
             }
+            // Add buffer vectors to total (approximate, may have overlap)
+            stats.total_vectors += buffer_vectors as i64;
             stats.dimensions = manifest.dimensions;
+        } else if buffer_vectors > 0 {
+            // No manifest yet but buffer has vectors
+            stats.total_vectors = buffer_vectors as i64;
+            if let Some(buffer) = &self.hot_buffer {
+                if let Some(dims) = buffer.dimensions().await {
+                    stats.dimensions = dims;
+                }
+            }
         }
         stats
     }
@@ -341,4 +545,6 @@ pub struct Stats {
     pub total_vectors: i64,
     pub dimensions: usize,
     pub loaded_segments: usize,
+    pub buffer_vectors: usize,
+    pub buffer_deleted: usize,
 }
