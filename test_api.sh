@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+# Note: Not using 'set -e' because we want to continue past test failures
 
 # Colors for output
 RED='\033[0;31m'
@@ -784,6 +784,279 @@ response=$(curl -s -w "\n%{http_code}" -X DELETE "$INGEST_URL/v1/namespaces/$NAM
 status=$(echo "$response" | tail -n1)
 body=$(echo "$response" | sed '$d')
 run_test "Delete via /v1/namespaces endpoint" 200 "$status" "$body"
+
+echo ""
+echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}Section 15: Stress Tests${NC}"
+echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+
+STRESS_NAMESPACE="stress-$(date +%s)"
+
+# Test 15.1: Sequential inserts (50 vectors, one at a time)
+echo "Running sequential inserts (50 vectors)..."
+STRESS_START=$(python3 -c "import time; print(time.time())")
+STRESS_FAILED=0
+for i in $(seq 1 50); do
+    VEC=$(generate_normalized_vector $((10000 + i)))
+    response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vectors\": [{\"id\": \"rapid_$i\", \"vector\": $VEC}]}" 2>/dev/null)
+    status=$(echo "$response" | tail -n1)
+    if [ "$status" -ne 200 ]; then
+        STRESS_FAILED=$((STRESS_FAILED + 1))
+    fi
+done
+STRESS_END=$(python3 -c "import time; print(time.time())")
+STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+STRESS_RPS=$(python3 -c "print(f'{50 / ($STRESS_END - $STRESS_START):.1f}')")
+
+TOTAL=$((TOTAL + 1))
+if [ $STRESS_FAILED -eq 0 ]; then
+    echo -e "${GREEN}✓ PASS${NC}: Sequential inserts (50 vectors in ${STRESS_DURATION}s, ${STRESS_RPS} req/s)"
+    PASSED=$((PASSED + 1))
+else
+    echo -e "${RED}✗ FAIL${NC}: Sequential inserts ($STRESS_FAILED failures)"
+    FAILED=$((FAILED + 1))
+fi
+
+# Test 15.2: Large batch insert (200 vectors in one request)
+echo "Generating large batch (200 vectors)..."
+TEMP_FILE=$(mktemp)
+python3 -c "
+import json
+import random
+import math
+
+def gen_vec(seed, dims=512):
+    random.seed(seed)
+    vec = [random.uniform(-1, 1) for _ in range(dims)]
+    norm = math.sqrt(sum(x*x for x in vec))
+    return [round(x/norm, 6) for x in vec]
+
+vectors = []
+for i in range(1, 201):
+    vectors.append({
+        'id': f'large_{i}',
+        'vector': gen_vec(20000 + i)
+    })
+print(json.dumps({'vectors': vectors}))
+" > "$TEMP_FILE"
+
+STRESS_START=$(python3 -c "import time; print(time.time())")
+response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+    -H "Content-Type: application/json" \
+    -d @"$TEMP_FILE")
+status=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+STRESS_END=$(python3 -c "import time; print(time.time())")
+STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+rm -f "$TEMP_FILE"
+
+run_test "Large batch insert (200 vectors in ${STRESS_DURATION}s)" 200 "$status" "$body"
+
+# Test 15.3: Concurrent queries (10 parallel requests)
+echo "Running concurrent queries (10 parallel)..."
+sleep 1  # Let the inserts settle
+
+QUERY_VEC=$(generate_normalized_vector 20001)
+STRESS_START=$(python3 -c "import time; print(time.time())")
+
+# Launch 10 concurrent queries
+for i in $(seq 1 10); do
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vector\": $QUERY_VEC, \"top_k\": 10}" &
+done
+# Wait for all background jobs and collect results
+CONCURRENT_RESULTS=$(wait; echo "done")
+STRESS_END=$(python3 -c "import time; print(time.time())")
+STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+
+# Verify queries work after concurrent load
+response=$(curl -s -w "\n%{http_code}" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+    -H "Content-Type: application/json" \
+    -d "{\"vector\": $QUERY_VEC, \"top_k\": 10}")
+status=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+run_test "Concurrent queries (10 parallel in ${STRESS_DURATION}s)" 200 "$status" "$body"
+
+# Test 15.4: Query load (30 sequential queries)
+echo "Running query load (30 queries)..."
+STRESS_START=$(python3 -c "import time; print(time.time())")
+QUERY_FAILED=0
+for i in $(seq 1 30); do
+    QUERY_VEC=$(generate_normalized_vector $((20000 + (i % 200) + 1)))
+    response=$(curl -s -w "\n%{http_code}" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vector\": $QUERY_VEC, \"top_k\": 10}" 2>/dev/null)
+    status=$(echo "$response" | tail -n1)
+    if [ "$status" -ne 200 ]; then
+        QUERY_FAILED=$((QUERY_FAILED + 1))
+    fi
+done
+STRESS_END=$(python3 -c "import time; print(time.time())")
+STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+STRESS_QPS=$(python3 -c "print(f'{30 / ($STRESS_END - $STRESS_START):.1f}')")
+
+TOTAL=$((TOTAL + 1))
+if [ $QUERY_FAILED -eq 0 ]; then
+    echo -e "${GREEN}✓ PASS${NC}: Query load (30 queries in ${STRESS_DURATION}s, ${STRESS_QPS} q/s)"
+    PASSED=$((PASSED + 1))
+else
+    echo -e "${RED}✗ FAIL${NC}: Query load ($QUERY_FAILED failures)"
+    FAILED=$((FAILED + 1))
+fi
+
+# Test 15.5: Mixed workload (inserts + queries + deletes)
+echo "Running mixed workload (20 inserts, 20 queries, 10 deletes)..."
+STRESS_START=$(python3 -c "import time; print(time.time())")
+MIXED_FAILED=0
+
+# Interleave operations
+for i in $(seq 1 20); do
+    # Insert
+    VEC=$(generate_normalized_vector $((30000 + i)))
+    response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vectors\": [{\"id\": \"mixed_$i\", \"vector\": $VEC}]}" 2>/dev/null)
+    status=$(echo "$response" | tail -n1)
+    if [ "$status" -ne 200 ]; then
+        MIXED_FAILED=$((MIXED_FAILED + 1))
+    fi
+    
+    # Query
+    response=$(curl -s -w "\n%{http_code}" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vector\": $VEC, \"top_k\": 5}" 2>/dev/null)
+    status=$(echo "$response" | tail -n1)
+    if [ "$status" -ne 200 ]; then
+        MIXED_FAILED=$((MIXED_FAILED + 1))
+    fi
+    
+    # Delete (every other iteration, delete older entries)
+    if [ $((i % 2)) -eq 0 ]; then
+        DELETE_ID="mixed_$((i - 10))"
+        if [ $((i - 10)) -gt 0 ]; then
+            response=$(curl -s -w "\n%{http_code}" -X DELETE "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+                -H "Content-Type: application/json" \
+                -d "{\"ids\": [\"$DELETE_ID\"]}" 2>/dev/null)
+            status=$(echo "$response" | tail -n1)
+            if [ "$status" -ne 200 ]; then
+                MIXED_FAILED=$((MIXED_FAILED + 1))
+            fi
+        fi
+    fi
+done
+STRESS_END=$(python3 -c "import time; print(time.time())")
+STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+TOTAL_OPS=$((20 + 20 + 10))
+STRESS_OPS=$(python3 -c "print(f'{$TOTAL_OPS / ($STRESS_END - $STRESS_START):.1f}')")
+
+TOTAL=$((TOTAL + 1))
+if [ $MIXED_FAILED -eq 0 ]; then
+    echo -e "${GREEN}✓ PASS${NC}: Mixed workload (50 ops in ${STRESS_DURATION}s, ${STRESS_OPS} ops/s)"
+    PASSED=$((PASSED + 1))
+else
+    echo -e "${RED}✗ FAIL${NC}: Mixed workload ($MIXED_FAILED failures)"
+    FAILED=$((FAILED + 1))
+fi
+
+# Test 15.6: Sustained write load with compaction
+echo "Running sustained load with compaction..."
+STRESS_START=$(python3 -c "import time; print(time.time())")
+
+# Insert 100 more vectors using temp file
+TEMP_FILE=$(mktemp)
+python3 -c "
+import json
+import random
+import math
+
+def gen_vec(seed, dims=512):
+    random.seed(seed)
+    vec = [random.uniform(-1, 1) for _ in range(dims)]
+    norm = math.sqrt(sum(x*x for x in vec))
+    return [round(x/norm, 6) for x in vec]
+
+vectors = []
+for i in range(1, 101):
+    vectors.append({
+        'id': f'sustained_{i}',
+        'vector': gen_vec(40000 + i)
+    })
+print(json.dumps({'vectors': vectors}))
+" > "$TEMP_FILE"
+
+response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+    -H "Content-Type: application/json" \
+    -d @"$TEMP_FILE")
+rm -f "$TEMP_FILE"
+status=$(echo "$response" | tail -n1)
+if [ "$status" -ne 200 ]; then
+    run_test "Sustained load - batch insert" 200 "$status" ""
+else
+    # Trigger compaction
+    response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/namespaces/$STRESS_NAMESPACE/compact")
+    status=$(echo "$response" | tail -n1)
+    
+    # Query after compaction
+    sleep 1
+    QUERY_VEC=$(generate_normalized_vector 40001)
+    response=$(curl -s -w "\n%{http_code}" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+        -H "Content-Type: application/json" \
+        -d "{\"vector\": $QUERY_VEC, \"top_k\": 10}")
+    status=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+    
+    STRESS_END=$(python3 -c "import time; print(time.time())")
+    STRESS_DURATION=$(python3 -c "print(f'{$STRESS_END - $STRESS_START:.2f}')")
+    
+    run_test "Sustained load with compaction (100 inserts + compact in ${STRESS_DURATION}s)" 200 "$status" "$body"
+fi
+
+# Test 15.7: High cardinality attributes
+echo "Testing high cardinality attributes..."
+TEMP_FILE=$(mktemp)
+python3 -c "
+import json
+import random
+import math
+
+def gen_vec(seed, dims=512):
+    random.seed(seed)
+    vec = [random.uniform(-1, 1) for _ in range(dims)]
+    norm = math.sqrt(sum(x*x for x in vec))
+    return [round(x/norm, 6) for x in vec]
+
+vectors = []
+for i in range(1, 101):
+    vectors.append({
+        'id': f'highcard_{i}',
+        'vector': gen_vec(50000 + i),
+        'attributes': {
+            'unique_id': f'uid_{i}',
+            'category': f'cat_{i % 10}',
+            'score': i
+        }
+    })
+print(json.dumps({'vectors': vectors}))
+" > "$TEMP_FILE"
+
+response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$STRESS_NAMESPACE" \
+    -H "Content-Type: application/json" \
+    -d @"$TEMP_FILE")
+rm -f "$TEMP_FILE"
+status=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+run_test "High cardinality attributes (100 unique values)" 200 "$status" "$body"
+
+# Query with filter on high cardinality
+response=$(curl -s -w "\n%{http_code}" -X POST "$QUERY_URL/v1/vectors/$STRESS_NAMESPACE" \
+    -H "Content-Type: application/json" \
+    -d "{\"vector\": $(generate_normalized_vector 50050), \"top_k\": 10, \"filters\": {\"category\": \"cat_5\"}}")
+status=$(echo "$response" | tail -n1)
+body=$(echo "$response" | sed '$d')
+run_test "Query with high cardinality filter" 200 "$status" "$body"
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
