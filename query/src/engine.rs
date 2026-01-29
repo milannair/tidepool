@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -38,6 +39,10 @@ pub struct Engine<S: Store + Clone> {
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Track the latest WAL entry timestamp we've processed
     last_wal_ts: RwLock<i64>,
+    /// Track when we last refreshed state from S3
+    last_refresh: RwLock<Option<Instant>>,
+    /// Minimum interval between S3 refreshes
+    refresh_interval: Duration,
     tokenizer: DefaultTokenizer,
     bm25_k1: f32,
     bm25_b: f32,
@@ -52,6 +57,10 @@ pub struct EngineOptions {
     pub bm25_b: f32,
     pub rrf_k: usize,
     pub tokenizer_config: tidepool_common::text::TokenizerConfig,
+    /// Minimum interval between S3 state refreshes (manifest, WAL, tombstones)
+    /// Lower values = more real-time but more S3 calls
+    /// Default: 1 second
+    pub refresh_interval_ms: u64,
 }
 
 impl Default for EngineOptions {
@@ -63,6 +72,7 @@ impl Default for EngineOptions {
             bm25_b: 0.75,
             rrf_k: 60,
             tokenizer_config: tidepool_common::text::TokenizerConfig::default(),
+            refresh_interval_ms: 1000, // 1 second default
         }
     }
 }
@@ -144,6 +154,8 @@ impl<S: Store + Clone + 'static> Engine<S> {
             id_versions: RwLock::new(HashMap::new()),
             hot_buffer,
             last_wal_ts: RwLock::new(0),
+            last_refresh: RwLock::new(None),
+            refresh_interval: Duration::from_millis(opts.refresh_interval_ms),
             tokenizer,
             bm25_k1: opts.bm25_k1,
             bm25_b: opts.bm25_b,
@@ -375,7 +387,27 @@ impl<S: Store + Clone + 'static> Engine<S> {
         }
     }
 
+    /// Check if enough time has passed to warrant a full S3 refresh
+    async fn should_refresh(&self) -> bool {
+        let last = self.last_refresh.read().await;
+        match *last {
+            Some(instant) => instant.elapsed() >= self.refresh_interval,
+            None => true, // First time, always refresh
+        }
+    }
+
+    /// Update the last refresh timestamp
+    async fn mark_refreshed(&self) {
+        let mut last = self.last_refresh.write().await;
+        *last = Some(Instant::now());
+    }
+
     async fn refresh_state(&self) {
+        // Skip S3 calls if we refreshed recently (reduces latency under load)
+        if !self.should_refresh().await {
+            return;
+        }
+
         let changed = self.load_manifest().await.unwrap_or(false);
         if changed {
             // Clean up stale cache files when manifest changes
@@ -406,6 +438,9 @@ impl<S: Store + Clone + 'static> Engine<S> {
 
         // Scan WAL for recent writes (provides real-time visibility)
         self.scan_wal().await;
+
+        // Mark that we've refreshed
+        self.mark_refreshed().await;
     }
 
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, String> {

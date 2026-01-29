@@ -55,6 +55,11 @@ async fn main() {
         info!("Real-time updates disabled (HOT_BUFFER_MAX_SIZE=0)");
     }
 
+    info!(
+        "State refresh interval: {}ms (REFRESH_INTERVAL_MS)",
+        cfg.refresh_interval_ms
+    );
+
     let namespaces = NamespaceManager::new(
         storage,
         Some(cfg.cache_dir.clone()),
@@ -65,6 +70,7 @@ async fn main() {
             bm25_b: cfg.bm25_b,
             rrf_k: cfg.rrf_k,
             tokenizer_config: cfg.tokenizer_config(),
+            refresh_interval_ms: cfg.refresh_interval_ms,
         },
         cfg.hot_buffer_max_size,
         cfg.allowed_namespaces.clone(),

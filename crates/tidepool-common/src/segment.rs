@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use hex::encode as hex_encode;
 use memmap2::Mmap;
 use ordered_float::OrderedFloat;
@@ -310,45 +310,6 @@ impl<S: Store> Writer<S> {
             doc_count: docs.len() as i64,
             dimensions,
         }))
-    }
-    
-    /// Write v1 format segment (legacy)
-    fn write_segment_v1(&self, docs: &[Document], dimensions: usize) -> Result<Vec<u8>, StorageError> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"TPVS");
-        buf.write_u32::<LittleEndian>(1)
-            .map_err(|e| StorageError::Other(format!("write version: {}", e)))?;
-        buf.write_u32::<LittleEndian>(docs.len() as u32)
-            .map_err(|e| StorageError::Other(format!("write vector count: {}", e)))?;
-        buf.write_u32::<LittleEndian>(dimensions as u32)
-            .map_err(|e| StorageError::Other(format!("write dimensions: {}", e)))?;
-
-        let mut attr_data = Vec::with_capacity(docs.len());
-
-        for doc in docs {
-            for v in &doc.vector {
-                buf.write_f32::<LittleEndian>(*v)
-                    .map_err(|e| StorageError::Other(format!("write vector: {}", e)))?;
-            }
-            let attributes_json = match &doc.attributes {
-                Some(attrs) => serde_json::to_vec(attrs)
-                    .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?,
-                None => Vec::new(),
-            };
-            attr_data.push(SegmentAttr {
-                id: doc.id.clone(),
-                attributes_json,
-            });
-        }
-
-        let attr_bytes = rkyv::to_bytes::<_, 256>(&attr_data)
-            .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?;
-        let attr_bytes = attr_bytes.as_ref();
-        buf.write_u32::<LittleEndian>(attr_bytes.len() as u32)
-            .map_err(|e| StorageError::Other(format!("write attr length: {}", e)))?;
-        buf.extend_from_slice(attr_bytes);
-        
-        Ok(buf)
     }
 }
 

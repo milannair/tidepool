@@ -41,6 +41,9 @@ pub struct Config {
     pub wal_batch_flush_interval: Duration,
     // Real-time updates (WAL-based)
     pub hot_buffer_max_size: usize,
+    /// Minimum interval between S3 state refreshes in milliseconds
+    /// Lower = more real-time, higher = fewer S3 calls
+    pub refresh_interval_ms: u64,
     // Full-text search
     pub text_index_enabled: bool,
     pub bm25_k1: f32,
@@ -91,6 +94,7 @@ impl Config {
             wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
             // Real-time updates (WAL-based)
             hot_buffer_max_size: parse_usize("HOT_BUFFER_MAX_SIZE", 10_000),
+            refresh_interval_ms: parse_usize("REFRESH_INTERVAL_MS", 1000) as u64,
             // Full-text search
             text_index_enabled: parse_bool("TEXT_INDEX_ENABLED", true),
             bm25_k1: parse_f32("BM25_K1", 1.2),
