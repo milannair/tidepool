@@ -13,6 +13,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "limit"] }
 thiserror = "1"
+roaring = "0.10"
 
 # Local crate
 tidepool-common = { path = "../crates/tidepool-common" }

@@ -35,6 +35,8 @@ pub struct Config {
     pub quantization_rerank_factor: usize,
     pub wal_batch_max_entries: usize,
     pub wal_batch_flush_interval: Duration,
+    // Real-time updates (WAL-based)
+    pub hot_buffer_max_size: usize,
 }
 
 impl Config {
@@ -70,6 +72,8 @@ impl Config {
             quantization_rerank_factor: parse_usize("QUANTIZATION_RERANK_FACTOR", 4),
             wal_batch_max_entries: parse_usize("WAL_BATCH_MAX_ENTRIES", 1),
             wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
+            // Real-time updates (WAL-based)
+            hot_buffer_max_size: parse_usize("HOT_BUFFER_MAX_SIZE", 10_000),
         };
 
         cfg.validate()?;

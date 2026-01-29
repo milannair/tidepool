@@ -13,6 +13,7 @@ use tracing::{error, info};
 use tidepool_common::config::Config;
 use tidepool_common::document::{NamespaceInfo, QueryRequest};
 use tidepool_common::storage::S3Store;
+use tidepool_query::buffer::HotBuffer;
 use tidepool_query::engine::{Engine, EngineOptions};
 
 #[derive(Clone)]
@@ -46,7 +47,17 @@ async fn main() {
         }
     };
 
-    let engine = Engine::new_with_options(
+    // Create hot buffer for WAL-based real-time updates
+    // The engine will scan WAL files from S3 to populate this buffer
+    let hot_buffer = if cfg.hot_buffer_max_size > 0 {
+        info!("Real-time updates enabled via WAL scanning (buffer size: {})", cfg.hot_buffer_max_size);
+        Some(Arc::new(HotBuffer::new(cfg.hot_buffer_max_size)))
+    } else {
+        info!("Real-time updates disabled (HOT_BUFFER_MAX_SIZE=0)");
+        None
+    };
+
+    let engine = Engine::new_with_buffer(
         storage,
         cfg.namespace.clone(),
         Some(cfg.cache_dir.clone()),
@@ -54,6 +65,7 @@ async fn main() {
             hnsw_ef_search: cfg.hnsw_ef_search,
             quantization_rerank_factor: cfg.quantization_rerank_factor,
         },
+        hot_buffer.clone(),
     );
 
     if let Err(err) = engine.load_manifest().await {
