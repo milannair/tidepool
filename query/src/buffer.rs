@@ -498,9 +498,11 @@ impl HotBuffer {
     }
 }
 
+/// Convert cosine distance to score.
+/// Cosine distance [0, 2]: 0=identical (score 1), 1=orthogonal (score 0), 2=opposite (score 0)
 fn distance_to_score(dist: f32) -> f32 {
     if dist.is_finite() {
-        1.0 / (1.0 + dist)
+        (1.0 - dist).max(0.0)
     } else {
         0.0
     }

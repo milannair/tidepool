@@ -485,7 +485,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
                             }
                             vec_out.push(RawResult {
                                 id: seg_data.ids[r.index].clone(),
-                                score: distance_to_score(r.dist),
+                                score: distance_to_score(r.dist, metric),
                                 attributes: seg_data.attributes[r.index].clone(),
                                 vector,
                             });
@@ -748,11 +748,27 @@ fn parse_fusion(req: &QueryRequest) -> FusionMode {
     }
 }
 
-fn distance_to_score(dist: f32) -> f32 {
-    if dist.is_finite() {
-        1.0 / (1.0 + dist)
-    } else {
-        0.0
+/// Convert distance to score based on metric type.
+/// 
+/// - Cosine distance [0, 2]: 0=identical (score 1), 1=orthogonal (score 0), 2=opposite (score 0)
+/// - Euclidean squared [0, ∞): Uses inverse formula, approaches 0 as distance grows
+/// - Dot product [-∞, ∞): Negated distance, so lower dist = higher score
+fn distance_to_score(dist: f32, metric: DistanceMetric) -> f32 {
+    if !dist.is_finite() {
+        return 0.0;
+    }
+    match metric {
+        // Cosine: dist=0 → 1.0, dist=1 (orthogonal) → 0.0, dist≥1 → 0.0
+        DistanceMetric::Cosine => (1.0 - dist).max(0.0),
+        // Euclidean: inverse falloff, dist=0 → 1.0, larger dist → approaches 0
+        DistanceMetric::Euclidean => 1.0 / (1.0 + dist),
+        // Dot product: negated, so -dist gives similarity. Normalize to [0,1] roughly
+        DistanceMetric::DotProduct => {
+            // dist is -dot_product, so -dist = dot_product
+            // Sigmoid-like transform: high dot → score near 1, low dot → score near 0
+            let dot = -dist;
+            1.0 / (1.0 + (-dot).exp())
+        }
     }
 }
 
