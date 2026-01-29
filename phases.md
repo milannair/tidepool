@@ -479,101 +479,11 @@ pub struct NamespaceManager<S: Store + Clone> {
 
 ---
 
-## Phase 9: Deterministic Vector Ordering
-
-**Objective:** Maximize early-exit effectiveness by reordering vectors within posting lists so that high-quality candidates appear first, causing top-k bounds to tighten rapidly and most distance computations to abort early.
-
-**Why Ninth:** After IVF partitions vectors and quantization reduces precision, the *order* in which vectors are scanned within each cluster determines how quickly bounds tighten. Random ordering wastes SIMD cycles on vectors that will never make top-k.
-
-### Why This Is Not Commonly Implemented
-- Requires control over segment layout (cloud-hosted DBs often don't have this)
-- Only beneficial with early-exit distance kernels (requires Phase 4)
-- Must be done at compaction time (runtime reordering defeats the purpose)
-- Academic ANN papers focus on recall, not average-case latency
-- Retrofitting into mutable indexes is complex; immutable segments make this trivial
-
-### Techniques
-- **Centroid-projected ordering:** Sort vectors by `dot(v, centroid)` descending within each posting list
-- **Reference direction sorting:** Use the centroid as a "reference query" and sort by similarity to it
-- **Score upper-bound ordering:** For quantized vectors, sort by maximum possible score
-- **Batch-aware layout:** Group vectors likely to be co-retrieved for better cache locality
-
-### Deliverables
-- [ ] `sort_posting_list_by_centroid_similarity()` in compaction pipeline
-- [ ] Configurable ordering strategy: `centroid | random | score_bound`
-- [ ] Early-exit dot product kernel with threshold parameter (`dot_f32_early_exit_avx2`)
-- [ ] Benchmark: measure % of SIMD iterations skipped per query
-- [ ] A/B comparison: ordered vs random posting lists
-
-**Exit Criteria:**
-- Average SIMD iterations per distance computation reduced by >50%
-- p50 latency improvement of 1.5-2x on IVF queries with nprobe=10
-- Zero impact on recall (ordering is internal, not algorithmic)
-
----
-
-## Phase 10: Multi-Stage Pruning
-
-**Objective:** Cascade cheap approximate checks before expensive exact computation.
-
-**Why Tenth:** Combines IVF, quantization, vector ordering, and HNSW into optimal query plan.
-
-### Techniques
-- **Bound propagation:** Use quantized distance as lower bound
-- **Candidate elimination:** Skip vectors where `lower_bound > k-th best`
-- **Approx → exact cascade:** SQ8 scan → f16 rerank → f32 final
-- **Adaptive nprobe:** Increase clusters if early results are poor
-
-### Deliverables
-- [ ] `CascadeSearch` query executor
-- [ ] Bound tracking with priority queue
-- [ ] Early termination when bounds converge
-- [ ] Query planner selecting strategy by segment size
-
-**Exit Criteria:**
-- <10% of vectors require f32 distance computation
-- p99 latency <100ms at 1M vectors
-
----
-
-## Phase 11: Query-Adaptive Index Resolution (QAIR)
-
-**Objective:** Dynamically adjust index work per-query based on confidence signals, reducing median latency for "easy" queries while maintaining accuracy for "hard" queries.
-
-**Why Eleventh:** Static ANN parameters (nprobe, rerank depth, quantization level) are tuned for worst-case queries. Most queries are not worst-case. QAIR exploits this distribution to do less work on average.
-
-### Confidence Signals
-| Signal | Computation | Interpretation |
-|--------|-------------|----------------|
-| **Centroid gap** | `dist(q, c1) - dist(q, c2)` | Large gap → high confidence |
-| **Score entropy** | `-Σ p_i log(p_i)` over top-k centroid scores | Low entropy → confident |
-| **Top-k variance** | Variance of distances in initial top-k | Low variance → interchangeable |
-
-### Adaptive Parameters
-| Parameter | High Confidence | Low Confidence |
-|-----------|-----------------|----------------|
-| `nprobe` | 1-3 clusters | 10-20 clusters |
-| `rerank_depth` | 1x top-k | 3-5x top-k |
-| `quantization` | SQ8 only | SQ8 → f16 → f32 cascade |
-
-### Deliverables
-- [ ] `QairConfig` struct with calibration parameters
-- [ ] `compute_query_confidence()` function
-- [ ] `adapt_search_params()` mapping confidence → parameters
-- [ ] Calibration tool for tuning thresholds
-- [ ] Config flag: `adaptive: bool` to enable/disable QAIR
-
-**Exit Criteria:**
-- p50 latency reduced by 30-50% vs static parameters
-- p99 recall matches static parameters (no tail regression)
-
----
-
-## Phase 12: Full-Text Search
+## Phase 9: Full-Text Search
 
 **Objective:** Add BM25-based full-text search and hybrid vector+text retrieval.
 
-**Why Twelfth:** Many use cases require combining semantic (vector) search with keyword (text) search. Hybrid retrieval consistently outperforms either approach alone.
+**Why Ninth:** Many use cases require combining semantic (vector) search with keyword (text) search. Hybrid retrieval consistently outperforms either approach alone. Adding this early enables more complete applications.
 
 ### Architecture
 
@@ -669,6 +579,96 @@ else:
 
 ---
 
+## Phase 10: Deterministic Vector Ordering
+
+**Objective:** Maximize early-exit effectiveness by reordering vectors within posting lists so that high-quality candidates appear first, causing top-k bounds to tighten rapidly and most distance computations to abort early.
+
+**Why Tenth:** After IVF partitions vectors and quantization reduces precision, the *order* in which vectors are scanned within each cluster determines how quickly bounds tighten. Random ordering wastes SIMD cycles on vectors that will never make top-k.
+
+### Why This Is Not Commonly Implemented
+- Requires control over segment layout (cloud-hosted DBs often don't have this)
+- Only beneficial with early-exit distance kernels (requires Phase 4)
+- Must be done at compaction time (runtime reordering defeats the purpose)
+- Academic ANN papers focus on recall, not average-case latency
+- Retrofitting into mutable indexes is complex; immutable segments make this trivial
+
+### Techniques
+- **Centroid-projected ordering:** Sort vectors by `dot(v, centroid)` descending within each posting list
+- **Reference direction sorting:** Use the centroid as a "reference query" and sort by similarity to it
+- **Score upper-bound ordering:** For quantized vectors, sort by maximum possible score
+- **Batch-aware layout:** Group vectors likely to be co-retrieved for better cache locality
+
+### Deliverables
+- [ ] `sort_posting_list_by_centroid_similarity()` in compaction pipeline
+- [ ] Configurable ordering strategy: `centroid | random | score_bound`
+- [ ] Early-exit dot product kernel with threshold parameter (`dot_f32_early_exit_avx2`)
+- [ ] Benchmark: measure % of SIMD iterations skipped per query
+- [ ] A/B comparison: ordered vs random posting lists
+
+**Exit Criteria:**
+- Average SIMD iterations per distance computation reduced by >50%
+- p50 latency improvement of 1.5-2x on IVF queries with nprobe=10
+- Zero impact on recall (ordering is internal, not algorithmic)
+
+---
+
+## Phase 11: Multi-Stage Pruning
+
+**Objective:** Cascade cheap approximate checks before expensive exact computation.
+
+**Why Eleventh:** Combines IVF, quantization, vector ordering, and HNSW into optimal query plan.
+
+### Techniques
+- **Bound propagation:** Use quantized distance as lower bound
+- **Candidate elimination:** Skip vectors where `lower_bound > k-th best`
+- **Approx → exact cascade:** SQ8 scan → f16 rerank → f32 final
+- **Adaptive nprobe:** Increase clusters if early results are poor
+
+### Deliverables
+- [ ] `CascadeSearch` query executor
+- [ ] Bound tracking with priority queue
+- [ ] Early termination when bounds converge
+- [ ] Query planner selecting strategy by segment size
+
+**Exit Criteria:**
+- <10% of vectors require f32 distance computation
+- p99 latency <100ms at 1M vectors
+
+---
+
+## Phase 12: Query-Adaptive Index Resolution (QAIR)
+
+**Objective:** Dynamically adjust index work per-query based on confidence signals, reducing median latency for "easy" queries while maintaining accuracy for "hard" queries.
+
+**Why Twelfth:** Static ANN parameters (nprobe, rerank depth, quantization level) are tuned for worst-case queries. Most queries are not worst-case. QAIR exploits this distribution to do less work on average.
+
+### Confidence Signals
+| Signal | Computation | Interpretation |
+|--------|-------------|----------------|
+| **Centroid gap** | `dist(q, c1) - dist(q, c2)` | Large gap → high confidence |
+| **Score entropy** | `-Σ p_i log(p_i)` over top-k centroid scores | Low entropy → confident |
+| **Top-k variance** | Variance of distances in initial top-k | Low variance → interchangeable |
+
+### Adaptive Parameters
+| Parameter | High Confidence | Low Confidence |
+|-----------|-----------------|----------------|
+| `nprobe` | 1-3 clusters | 10-20 clusters |
+| `rerank_depth` | 1x top-k | 3-5x top-k |
+| `quantization` | SQ8 only | SQ8 → f16 → f32 cascade |
+
+### Deliverables
+- [ ] `QairConfig` struct with calibration parameters
+- [ ] `compute_query_confidence()` function
+- [ ] `adapt_search_params()` mapping confidence → parameters
+- [ ] Calibration tool for tuning thresholds
+- [ ] Config flag: `adaptive: bool` to enable/disable QAIR
+
+**Exit Criteria:**
+- p50 latency reduced by 30-50% vs static parameters
+- p99 recall matches static parameters (no tail regression)
+
+---
+
 ## Phase 13: System-Level Optimization
 
 **Objective:** Optimize end-to-end system behavior: cold starts, parallelism, resource management.
@@ -714,16 +714,16 @@ else:
 | Metric | Target | Phase |
 |--------|--------|-------|
 | Query latency p50 (100k vectors) | <20ms | 4 |
-| Query latency p99 (1M vectors) | <100ms | 10 |
-| Query latency p50 (1M vectors) | <30ms | 11 (QAIR) |
+| Query latency p99 (1M vectors) | <100ms | 11 |
+| Query latency p50 (1M vectors) | <30ms | 12 (QAIR) |
 | Write-to-query latency | <1s | 7 |
 | Ingest throughput | >10k docs/sec | 3 |
 | Memory per vector (128-dim) | <256 bytes | 6 |
 | Cold start time | <2s | 13 |
 | Recall@10 | >95% | 5 |
 | Multi-namespace init | <500ms | 8 |
-| SIMD early-exit rate | >50% | 9 |
-| BM25 search latency | <50ms | 12 |
+| BM25 search latency | <50ms | 9 |
+| SIMD early-exit rate | >50% | 10 |
 
 ---
 
@@ -747,9 +747,9 @@ Tidepool is fast not just because it uses ANN—but because it exploits **data l
 ## Ordering Rationale
 
 ```
-Foundation → HNSW → Zero-Copy → SIMD → IVF → Quantization → Real-Time → Namespaces → Ordering → Pruning → QAIR → Full-Text → System
-     ↓          ↓         ↓        ↓       ↓         ↓           ↓            ↓            ↓          ↓        ↓         ↓          ↓
-  Correct    Fast     Efficient  Faster  Scalable  Compact    Instant     Multi-Tenant  Layout    Cascade  Adaptive  Hybrid   Production
+Foundation → HNSW → Zero-Copy → SIMD → IVF → Quantization → Real-Time → Namespaces → Full-Text → Ordering → Pruning → QAIR → System
+     ↓          ↓         ↓        ↓       ↓         ↓           ↓            ↓            ↓            ↓          ↓        ↓         ↓
+  Correct    Fast     Efficient  Faster  Scalable  Compact    Instant     Multi-Tenant  Hybrid      Layout    Cascade  Adaptive  Production
 ```
 
 Each phase builds on the previous. Skipping phases creates technical debt:
@@ -758,8 +758,8 @@ Each phase builds on the previous. Skipping phases creates technical debt:
 - Quantization without IVF has nowhere to apply asymmetric search
 - **Real-time without foundation has no segments to search**
 - **Dynamic namespaces without real-time creates per-namespace overhead**
+- **Full-text without foundation has no storage backend**
 - **Ordering without IVF has no posting lists to reorder**
 - **Ordering without SIMD has no early-exit to exploit**
 - Pruning requires all prior techniques to cascade effectively
 - **QAIR without pruning has nothing to adapt**
-- **Full-text without foundation has no storage backend**
