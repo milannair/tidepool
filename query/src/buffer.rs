@@ -170,6 +170,9 @@ pub struct HotBuffer {
     text_index: RwLock<TextBufferIndex>,
     /// Bitmap of active (non-deleted) vectors
     active: RwLock<RoaringBitmap>,
+    /// Tombstone set for ALL deleted IDs (including those not in buffer)
+    /// This ensures deletes are immediately visible even for segment-only vectors
+    tombstones: RwLock<std::collections::HashSet<String>>,
     /// Insertion order for FIFO eviction (stores string IDs)
     insertion_order: RwLock<Vec<String>>,
     /// Maximum number of vectors to hold
@@ -201,6 +204,7 @@ impl HotBuffer {
             texts: RwLock::new(Vec::new()),
             text_index: RwLock::new(TextBufferIndex::new()),
             active: RwLock::new(RoaringBitmap::new()),
+            tombstones: RwLock::new(std::collections::HashSet::new()),
             insertion_order: RwLock::new(Vec::new()),
             max_size,
             last_manifest_version: AtomicU64::new(0),
@@ -225,6 +229,7 @@ impl HotBuffer {
         let mut texts = self.texts.write().await;
         let mut text_index = self.text_index.write().await;
         let mut active = self.active.write().await;
+        let mut tombstones = self.tombstones.write().await;
         let mut order = self.insertion_order.write().await;
         let mut dims = self.dimensions.write().await;
 
@@ -243,6 +248,9 @@ impl HotBuffer {
             }
 
             let string_id = doc.id.clone();
+            
+            // Remove from tombstones if re-inserting (upsert after delete)
+            tombstones.remove(&string_id);
 
             let tokens = doc
                 .text
@@ -293,14 +301,22 @@ impl HotBuffer {
     }
 
     /// Mark IDs as deleted.
+    /// This adds IDs to the tombstone set even if they're not in the buffer,
+    /// ensuring deletes are immediately visible for segment-only vectors.
     pub async fn delete(&self, ids: Vec<String>) {
         let id_to_index = self.id_to_index.read().await;
         let mut active = self.active.write().await;
+        let mut tombstones = self.tombstones.write().await;
         let mut order = self.insertion_order.write().await;
         let mut text_index = self.text_index.write().await;
         let mut texts = self.texts.write().await;
 
         for id in ids {
+            // Always add to tombstones (even if not in buffer)
+            // This ensures segment-only vectors are filtered out immediately
+            tombstones.insert(id.clone());
+            
+            // Also remove from active buffer if present
             if let Some(&idx) = id_to_index.get(&id) {
                 active.remove(idx as u32);
                 text_index.remove_doc(idx);
@@ -413,27 +429,39 @@ impl HotBuffer {
         }
     }
 
-    /// Get all deleted IDs (IDs that were in buffer but marked deleted).
+    /// Get all deleted IDs (includes both buffer-deleted and tombstoned IDs).
+    /// This returns IDs that should be excluded from query results.
     pub async fn get_deleted_ids(&self) -> std::collections::HashSet<String> {
         let id_to_index = self.id_to_index.read().await;
         let active = self.active.read().await;
+        let tombstones = self.tombstones.read().await;
         
-        id_to_index
-            .iter()
-            .filter(|(_, &idx)| !active.contains(idx as u32))
-            .map(|(id, _)| id.clone())
-            .collect()
+        // Combine: IDs in buffer that are inactive + all tombstoned IDs
+        let mut deleted: std::collections::HashSet<String> = tombstones.clone();
+        
+        for (id, &idx) in id_to_index.iter() {
+            if !active.contains(idx as u32) {
+                deleted.insert(id.clone());
+            }
+        }
+        
+        deleted
     }
 
     /// Get buffer statistics.
     pub async fn stats(&self) -> BufferStats {
         let id_to_index = self.id_to_index.read().await;
         let active = self.active.read().await;
+        let tombstones = self.tombstones.read().await;
         let dims = self.dimensions.read().await;
+
+        // Deleted count includes: inactive buffer entries + tombstones
+        let buffer_deleted = id_to_index.len() - active.len() as usize;
+        let total_deleted = buffer_deleted + tombstones.len();
 
         BufferStats {
             vector_count: active.len() as usize,
-            deleted_count: id_to_index.len() - active.len() as usize,
+            deleted_count: total_deleted,
             max_size: self.max_size,
             dimensions: *dims,
         }
@@ -452,10 +480,12 @@ impl HotBuffer {
             let mut texts = self.texts.write().await;
             let mut text_index = self.text_index.write().await;
             let mut active = self.active.write().await;
+            let mut tombstones = self.tombstones.write().await;
             let mut order = self.insertion_order.write().await;
             let mut dims = self.dimensions.write().await;
 
             let old_count = active.len();
+            let old_tombstones = tombstones.len();
             
             // Reset all state
             *index = HnswIndex::new(
@@ -470,16 +500,31 @@ impl HotBuffer {
             texts.clear();
             *text_index = TextBufferIndex::new();
             active.clear();
+            tombstones.clear();
             order.clear();
             *dims = None;
 
             tracing::info!(
-                "Buffer cleared after compaction: {} vectors removed (version {} -> {})",
+                "Buffer cleared after compaction: {} vectors, {} tombstones removed (version {} -> {})",
                 old_count,
+                old_tombstones,
                 old_version,
                 manifest_version
             );
         }
+    }
+
+    /// Prune tombstones that are already tracked in the persistent tombstone store.
+    /// Call this after loading tombstones from storage to avoid duplicate tracking.
+    /// Returns the number of tombstones pruned.
+    pub async fn prune_tombstones(&self, persistent_tombstones: &std::collections::HashSet<String>) -> usize {
+        let mut tombstones = self.tombstones.write().await;
+        let before = tombstones.len();
+        
+        // Remove tombstones that are already in the persistent store
+        tombstones.retain(|id| !persistent_tombstones.contains(id));
+        
+        before - tombstones.len()
     }
 
     /// Get the number of active vectors in the buffer.

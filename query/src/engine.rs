@@ -234,6 +234,16 @@ impl<S: Store + Clone + 'static> Engine<S> {
             .load()
             .await
             .map_err(|err| format!("failed to load tombstones: {}", err))?;
+        
+        // Prune hot buffer tombstones that are now in persistent storage
+        // This prevents the buffer tombstone set from growing indefinitely
+        if let Some(buffer) = &self.hot_buffer {
+            let pruned = buffer.prune_tombstones(&tombstones).await;
+            if pruned > 0 {
+                info!("Pruned {} tombstones from hot buffer (now in persistent store)", pruned);
+            }
+        }
+        
         let mut guard = self.tombstones.write().await;
         *guard = tombstones;
         Ok(())
