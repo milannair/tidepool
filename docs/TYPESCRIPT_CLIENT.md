@@ -307,14 +307,14 @@ console.log(namespaces); // ["default", "embeddings"]
 ### Get Ingest Status
 
 ```typescript
-async status(): Promise<IngestStatus>;
+async status(namespace?: string): Promise<IngestStatus>;
 ```
 
-**HTTP:** `GET /status`
+**HTTP:** `GET /v1/namespaces/{namespace}/status`
 
 **Example:**
 ```typescript
-const status = await client.status();
+const status = await client.status("default");
 console.log(`WAL entries: ${status.walEntries}, Segments: ${status.segments}`);
 ```
 
@@ -323,15 +323,15 @@ console.log(`WAL entries: ${status.walEntries}, Segments: ${status.segments}`);
 ### Trigger Compaction
 
 ```typescript
-async compact(): Promise<void>;
+async compact(namespace?: string): Promise<void>;
 ```
 
-**HTTP:** `POST /compact`
+**HTTP:** `POST /v1/namespaces/{namespace}/compact`
 
 **Example:**
 ```typescript
 // After large batch upload
-await client.compact();
+await client.compact("default");
 ```
 
 ---
@@ -410,7 +410,7 @@ const documents: Document[] = [
 await client.upsert(documents);
 
 // Trigger compaction
-await client.compact();
+await client.compact("default");
 
 // Query
 const results = await client.query([0.1, 0.2, 0.3, 0.4], { topK: 5 });
@@ -441,7 +441,7 @@ for (let i = 0; i < allDocuments.length; i += BATCH_SIZE) {
   console.log(`Uploaded ${Math.min(i + BATCH_SIZE, allDocuments.length)}/${allDocuments.length}`);
 }
 
-await client.compact();
+await client.compact("default");
 ```
 
 ### Error Handling

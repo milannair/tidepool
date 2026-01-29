@@ -8,7 +8,10 @@
 #   BUCKET_NAME            - S3 bucket name
 #
 # Optional tuning (defaults are production-ready):
-#   NAMESPACE              - Vector namespace (default: "default")
+#   NAMESPACE              - Restrict to a single namespace (unset = dynamic)
+#   ALLOWED_NAMESPACES     - Comma-separated allowlist (optional)
+#   MAX_NAMESPACES         - Max active namespaces per replica (optional)
+#   NAMESPACE_IDLE_TIMEOUT - Evict namespace state after inactivity (optional)
 #   CACHE_DIR              - Local cache directory (default: "/data")
 #   HNSW_EF_SEARCH         - HNSW search quality (default: "100", higher = better recall)
 #   IVF_NPROBE_DEFAULT     - IVF clusters to search (default: "10", higher = better recall)

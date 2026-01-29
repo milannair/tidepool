@@ -13,7 +13,10 @@ pub struct Config {
     pub aws_region: String,
     pub bucket_name: String,
     pub cache_dir: String,
-    pub namespace: String,
+    pub namespace: Option<String>,
+    pub allowed_namespaces: Option<Vec<String>>,
+    pub max_namespaces: Option<usize>,
+    pub namespace_idle_timeout: Option<Duration>,
     pub compaction_interval: Duration,
     pub port: String,
     pub read_timeout: Duration,
@@ -48,7 +51,10 @@ impl Config {
             aws_region: get_env_with_fallback("AWS_DEFAULT_REGION", "AWS_REGION"),
             bucket_name: get_env_with_fallback("AWS_S3_BUCKET_NAME", "BUCKET_NAME"),
             cache_dir: env::var("CACHE_DIR").unwrap_or_else(|_| "/data".to_string()),
-            namespace: env::var("NAMESPACE").unwrap_or_else(|_| "default".to_string()),
+            namespace: parse_optional_string("NAMESPACE"),
+            allowed_namespaces: parse_optional_csv("ALLOWED_NAMESPACES"),
+            max_namespaces: parse_optional_usize("MAX_NAMESPACES"),
+            namespace_idle_timeout: parse_optional_duration("NAMESPACE_IDLE_TIMEOUT"),
             compaction_interval: parse_duration_fallback("COMPACTION_INTERVAL", Duration::from_secs(300)),
             port: env::var("PORT").unwrap_or_else(|_| "8080".to_string()),
             read_timeout: parse_duration_fallback("READ_TIMEOUT", Duration::from_secs(30)),
@@ -108,6 +114,43 @@ pub enum ConfigError {
 
 fn get_env_with_fallback(primary: &str, fallback: &str) -> String {
     env::var(primary).unwrap_or_else(|_| env::var(fallback).unwrap_or_default())
+}
+
+fn parse_optional_string(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(raw) if !raw.trim().is_empty() => Some(raw),
+        _ => None,
+    }
+}
+
+fn parse_optional_csv(key: &str) -> Option<Vec<String>> {
+    let raw = parse_optional_string(key)?;
+    let values: Vec<String> = raw
+        .split(',')
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn parse_optional_usize(key: &str) -> Option<usize> {
+    let raw = parse_optional_string(key)?;
+    let value = raw.parse::<usize>().ok()?;
+    if value == 0 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_optional_duration(key: &str) -> Option<Duration> {
+    let raw = parse_optional_string(key)?;
+    parse_duration(&raw).ok()
 }
 
 fn parse_duration_fallback(key: &str, default: Duration) -> Duration {

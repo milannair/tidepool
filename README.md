@@ -24,7 +24,7 @@ curl -X POST http://localhost:8081/v1/vectors/default \
   -d '{"vectors": [{"id": "1", "vector": [0.1, 0.2, 0.3], "attributes": {"title": "Example"}}]}'
 
 # Trigger compaction (or wait for automatic compaction)
-curl -X POST http://localhost:8081/compact
+curl -X POST http://localhost:8081/v1/namespaces/default/compact
 
 # Query vectors (query service on port 8080)
 curl -X POST http://localhost:8080/v1/vectors/default \
@@ -146,7 +146,8 @@ Get namespace info.
 {
   "namespace": "default",
   "approx_count": 10000,
-  "dimensions": 1536
+  "dimensions": 1536,
+  "pending_compaction": false
 }
 ```
 
@@ -193,11 +194,11 @@ Delete vectors by ID.
 }
 ```
 
-**POST /compact**
+**POST /v1/namespaces/{namespace}/compact**
 
 Trigger manual compaction.
 
-**GET /status**
+**GET /v1/namespaces/{namespace}/status**
 
 Get ingest/compaction status.
 
@@ -221,7 +222,10 @@ Health check.
 | `AWS_REGION` | Yes | - | S3 region |
 | `BUCKET_NAME` | Yes | - | S3 bucket name |
 | `CACHE_DIR` | No | `/data` | Local cache directory |
-| `NAMESPACE` | No | `default` | Data namespace |
+| `NAMESPACE` | No | - | Restrict service to a single namespace (dynamic if unset) |
+| `ALLOWED_NAMESPACES` | No | - | Comma-separated allowlist for multi-tenant deployments |
+| `MAX_NAMESPACES` | No | - | Max active namespaces per replica (LRU eviction) |
+| `NAMESPACE_IDLE_TIMEOUT` | No | - | Evict namespace state after inactivity (e.g., `10m`) |
 | `COMPACTION_INTERVAL` | No | `5m` | Compaction interval |
 | `PORT` | No | `8080` | HTTP port |
 | `READ_TIMEOUT` | No | `30s` | HTTP read timeout |
@@ -243,6 +247,7 @@ Health check.
 | `QUANTIZATION_RERANK_FACTOR` | No | `4` | Fetch N× candidates, rerank with full precision |
 | `WAL_BATCH_MAX_ENTRIES` | No | `1` | Max WAL entries per batch write (ingest) |
 | `WAL_BATCH_FLUSH_INTERVAL` | No | `0ms` | Max time to wait before flushing WAL batch |
+| `HOT_BUFFER_MAX_SIZE` | No | `10000` | WAL hot buffer size per namespace (query) |
 
 ### Quantization Modes
 
@@ -340,7 +345,7 @@ curl -X POST http://localhost:8081/v1/vectors/default \
   }'
 
 # Trigger compaction
-curl -X POST http://localhost:8081/compact
+curl -X POST http://localhost:8081/v1/namespaces/default/compact
 
 # Query vectors (to query service)
 curl -X POST http://localhost:8080/v1/vectors/default \
@@ -430,7 +435,7 @@ If the build fails with `no Rust files in /app`, ensure the service is configure
 
 ## Current Limitations
 
-- Single namespace per service deployment
+- Dynamic namespaces supported (set `NAMESPACE` to lock to one)
 - Eventual consistency model (vectors become queryable after compaction)
 - No cursor-based pagination for result sets exceeding `top_k`
 
