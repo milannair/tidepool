@@ -213,17 +213,39 @@ impl HotBuffer {
         }
     }
 
-    /// Clear vectors that are now in compacted segments.
-    /// Called after compaction with the new manifest version.
+    /// Clear all vectors from the buffer after compaction.
+    /// Called when manifest changes - all buffered data is now in segments.
     pub async fn clear_compacted(&self, manifest_version: u64) {
         let old_version = self.last_manifest_version.swap(manifest_version, Ordering::SeqCst);
-        if manifest_version > old_version {
-            // For now, we keep the buffer as-is.
-            // Vectors will naturally age out via FIFO eviction.
-            // A more sophisticated approach would track which vectors
-            // were written before the compaction cutoff.
-            tracing::debug!(
-                "Buffer notified of compaction: version {} -> {}",
+        if manifest_version > old_version && old_version > 0 {
+            // Clear all buffer state - compacted data is now in segments
+            let mut index = self.index.write().await;
+            let mut id_to_index = self.id_to_index.write().await;
+            let mut index_to_id = self.index_to_id.write().await;
+            let mut attributes = self.attributes.write().await;
+            let mut active = self.active.write().await;
+            let mut order = self.insertion_order.write().await;
+            let mut dims = self.dimensions.write().await;
+
+            let old_count = active.len();
+            
+            // Reset all state
+            *index = HnswIndex::new(
+                BUFFER_HNSW_M,
+                BUFFER_HNSW_EF_CONSTRUCTION,
+                BUFFER_HNSW_EF_SEARCH,
+                DistanceMetric::Cosine,
+            );
+            id_to_index.clear();
+            index_to_id.clear();
+            attributes.clear();
+            active.clear();
+            order.clear();
+            *dims = None;
+
+            tracing::info!(
+                "Buffer cleared after compaction: {} vectors removed (version {} -> {})",
+                old_count,
                 old_version,
                 manifest_version
             );
