@@ -206,6 +206,16 @@ async fn upsert(
         return json_error(StatusCode::BAD_REQUEST, "vectors are required");
     }
 
+    // Validate each document has a non-empty vector
+    for (i, doc) in req.vectors.iter().enumerate() {
+        if doc.vector.is_empty() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("document at index {} is missing required 'vector' field", i),
+            );
+        }
+    }
+
     // Write to WAL for durability (query nodes will scan WAL for real-time visibility)
     if let Err(err) = handle.wal_writer.write_upsert(req.vectors.clone()).await {
         error!("Upsert error: {}", err);
