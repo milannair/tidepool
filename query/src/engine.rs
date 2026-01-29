@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,14 @@ pub struct Engine<S: Store + Clone> {
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Track the latest WAL entry timestamp we've processed
     last_wal_ts: RwLock<i64>,
+    /// WAL files we've fully read and applied (skip re-reading)
+    processed_wal_files: RwLock<HashSet<String>>,
+    /// Last time we listed WAL files from S3
+    last_wal_list: RwLock<Option<Instant>>,
+    /// Cached list of WAL file keys (used when not re-listing)
+    cached_wal_files: RwLock<Vec<String>>,
+    /// Minimum interval between WAL LIST operations
+    wal_list_interval: Duration,
     /// Track when we last refreshed state from S3
     last_refresh: RwLock<Option<Instant>>,
     /// Minimum interval between S3 refreshes
@@ -61,6 +70,8 @@ pub struct EngineOptions {
     /// Lower values = more real-time but more S3 calls
     /// Default: 1 second
     pub refresh_interval_ms: u64,
+    /// How often to re-list WAL files from S3 (default: 5000ms)
+    pub wal_list_interval_ms: u64,
 }
 
 impl Default for EngineOptions {
@@ -72,7 +83,8 @@ impl Default for EngineOptions {
             bm25_b: 0.75,
             rrf_k: 60,
             tokenizer_config: tidepool_common::text::TokenizerConfig::default(),
-            refresh_interval_ms: 1000, // 1 second default
+            refresh_interval_ms: 200, // 200ms default
+            wal_list_interval_ms: 5000,
         }
     }
 }
@@ -128,7 +140,9 @@ impl<S: Store + Clone + 'static> Engine<S> {
         hot_buffer: Option<Arc<HotBuffer>>,
     ) -> Self {
         let namespace = namespace.into();
-        let manifest_manager = Manager::new(storage.clone(), &namespace);
+        let cache_path = cache_dir.as_ref().map(PathBuf::from);
+        let manifest_manager =
+            Manager::new_with_cache(storage.clone(), &namespace, cache_path.clone());
         let segment_reader = Reader::new_with_options(
             storage.clone(),
             &namespace,
@@ -143,7 +157,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
 
         Self {
             storage: storage.clone(),
-            tombstone_manager: TombstoneManager::new(storage, &namespace),
+            tombstone_manager: TombstoneManager::new_with_cache(storage, &namespace, cache_path),
             namespace,
             manifest_manager,
             segment_reader,
@@ -154,6 +168,10 @@ impl<S: Store + Clone + 'static> Engine<S> {
             id_versions: RwLock::new(HashMap::new()),
             hot_buffer,
             last_wal_ts: RwLock::new(0),
+            processed_wal_files: RwLock::new(HashSet::new()),
+            last_wal_list: RwLock::new(None),
+            cached_wal_files: RwLock::new(Vec::new()),
+            wal_list_interval: Duration::from_millis(opts.wal_list_interval_ms),
             last_refresh: RwLock::new(None),
             refresh_interval: Duration::from_millis(opts.refresh_interval_ms),
             tokenizer,
@@ -174,6 +192,34 @@ impl<S: Store + Clone + 'static> Engine<S> {
             .load()
             .await
             .map_err(|err| format!("failed to load manifest: {}", err))?;
+        let mut guard = self.current_manifest.write().await;
+        let changed = guard
+            .as_ref()
+            .map(|current| current.version != manifest.version)
+            .unwrap_or(true);
+        if changed {
+            *guard = Some(manifest.clone());
+            info!(
+                "Loaded manifest version {} with {} segments",
+                manifest.version,
+                manifest.segments.len()
+            );
+        }
+        Ok(changed)
+    }
+
+    /// Load manifest only if changed (HEAD + cache). Returns true if manifest was updated.
+    async fn load_manifest_if_changed(&self) -> Result<bool, String> {
+        let opt_manifest = self
+            .manifest_manager
+            .load_if_changed()
+            .await
+            .map_err(|err| format!("failed to load manifest: {}", err))?;
+
+        let Some(manifest) = opt_manifest else {
+            return Ok(false);
+        };
+
         let mut guard = self.current_manifest.write().await;
         let changed = guard
             .as_ref()
@@ -240,6 +286,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
         guard.retain(|seg_id, _| keep.contains(seg_id));
     }
 
+    #[allow(dead_code)]
     async fn refresh_tombstones(&self) -> Result<(), String> {
         let tombstones = self
             .tombstone_manager
@@ -261,6 +308,30 @@ impl<S: Store + Clone + 'static> Engine<S> {
         Ok(())
     }
 
+    /// Refresh tombstones only if changed (HEAD + cache). Returns true if updated.
+    async fn refresh_tombstones_if_changed(&self) -> Result<bool, String> {
+        let opt_tombstones = self
+            .tombstone_manager
+            .load_if_changed()
+            .await
+            .map_err(|err| format!("failed to load tombstones: {}", err))?;
+
+        let Some(tombstones) = opt_tombstones else {
+            return Ok(false);
+        };
+
+        if let Some(buffer) = &self.hot_buffer {
+            let pruned = buffer.prune_tombstones(&tombstones).await;
+            if pruned > 0 {
+                info!("Pruned {} tombstones from hot buffer (now in persistent store)", pruned);
+            }
+        }
+
+        let mut guard = self.tombstones.write().await;
+        *guard = tombstones;
+        Ok(true)
+    }
+
     async fn rebuild_id_versions(&self, manifest: &Manifest) {
         let segments = self.loaded_segments.read().await;
         let mut id_versions = HashMap::new();
@@ -276,7 +347,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
     }
 
     /// Scan WAL files from S3 and populate the hot buffer.
-    /// Uses timestamp-based tracking to ensure new entries are always picked up.
+    /// Throttles LIST; only reads files not yet in processed_wal_files.
     async fn scan_wal(&self) {
         let Some(buffer) = &self.hot_buffer else {
             return;
@@ -291,26 +362,53 @@ impl<S: Store + Clone + 'static> Engine<S> {
         // Get the last processed timestamp
         let last_ts = *self.last_wal_ts.read().await;
 
-        // List all WAL files (always re-list to catch new files)
-        let wal_files = match self.wal_reader.list_wal_files().await {
-            Ok(files) => files,
-            Err(err) => {
-                warn!("Failed to list WAL files: {}", err);
-                return;
+        // Re-list WAL files only when interval has passed (reduces LIST calls)
+        let should_list = {
+            let last = self.last_wal_list.read().await;
+            match *last {
+                Some(instant) => instant.elapsed() >= self.wal_list_interval,
+                None => true,
             }
         };
+
+        if should_list {
+            match self.wal_reader.list_wal_files().await {
+                Ok(files) => {
+                    let mut last = self.last_wal_list.write().await;
+                    *last = Some(Instant::now());
+                    drop(last);
+                    let mut cached = self.cached_wal_files.write().await;
+                    *cached = files;
+                }
+                Err(err) => {
+                    warn!("Failed to list WAL files: {}", err);
+                    return;
+                }
+            }
+        }
+
+        let wal_files = self.cached_wal_files.read().await;
 
         if wal_files.is_empty() {
             return;
         }
 
-        // Read all WAL files and extract entries newer than last_ts
+        // Only read files we haven't fully processed yet
+        let processed = self.processed_wal_files.read().await;
+        let to_read: Vec<String> = wal_files
+            .iter()
+            .filter(|f| !processed.contains(*f))
+            .cloned()
+            .collect();
+        drop(processed);
+
         let mut docs_to_insert = Vec::new();
         let mut ids_to_delete = Vec::new();
         let mut max_ts = last_ts;
+        let mut newly_processed = Vec::new();
 
-        for wal_file in wal_files {
-            match self.wal_reader.read_wal_file(&wal_file).await {
+        for wal_file in &to_read {
+            match self.wal_reader.read_wal_file(wal_file).await {
                 Ok(entries) => {
                     for entry in entries {
                         // Skip entries already in segments (compacted)
@@ -340,10 +438,19 @@ impl<S: Store + Clone + 'static> Engine<S> {
                             _ => {}
                         }
                     }
+                    newly_processed.push(wal_file.clone());
                 }
                 Err(err) => {
-                    warn!("Failed to read WAL file: {}", err);
+                    warn!("Failed to read WAL file {}: {}", wal_file, err);
                 }
+            }
+        }
+
+        // Mark files as processed so we don't re-read them next refresh
+        if !newly_processed.is_empty() {
+            let mut processed = self.processed_wal_files.write().await;
+            for f in newly_processed {
+                processed.insert(f);
             }
         }
 
@@ -374,6 +481,12 @@ impl<S: Store + Clone + 'static> Engine<S> {
         {
             let mut ts = self.last_wal_ts.write().await;
             *ts = 0;
+        }
+
+        // Clear processed WAL files so we re-read them (entries after new manifest)
+        {
+            let mut processed = self.processed_wal_files.write().await;
+            processed.clear();
         }
 
         // Clear buffer when manifest changes (compacted data now in segments)
@@ -408,7 +521,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             return;
         }
 
-        let changed = self.load_manifest().await.unwrap_or(false);
+        let changed = self.load_manifest_if_changed().await.unwrap_or(false);
         if changed {
             // Clean up stale cache files when manifest changes
             if let Some(manifest) = self.current_manifest.read().await.clone() {
@@ -429,8 +542,8 @@ impl<S: Store + Clone + 'static> Engine<S> {
             self.reset_wal_state().await;
         }
         let _ = self.ensure_segments_loaded().await;
-        if changed || self.id_versions.read().await.is_empty() {
-            let _ = self.refresh_tombstones().await;
+        let tombstones_updated = self.refresh_tombstones_if_changed().await.unwrap_or(false);
+        if changed || tombstones_updated || self.id_versions.read().await.is_empty() {
             if let Some(manifest) = self.current_manifest.read().await.clone() {
                 self.rebuild_id_versions(&manifest).await;
             }

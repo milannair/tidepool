@@ -71,6 +71,7 @@ async fn main() {
             rrf_k: cfg.rrf_k,
             tokenizer_config: cfg.tokenizer_config(),
             refresh_interval_ms: cfg.refresh_interval_ms,
+            wal_list_interval_ms: cfg.wal_list_interval_ms,
         },
         cfg.hot_buffer_max_size,
         cfg.allowed_namespaces.clone(),
