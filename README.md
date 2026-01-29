@@ -112,6 +112,11 @@ Query vectors by similarity.
 ```json
 {
   "vector": [0.1, 0.2, 0.3, ...],
+  "text": "keyword search",
+  "mode": "hybrid",
+  "alpha": 0.7,
+  "fusion": "blend",
+  "rrf_k": 60,
   "top_k": 10,
   "ef_search": 100,
   "nprobe": 10,
@@ -131,7 +136,7 @@ Response:
     {
       "id": "doc-123",
       "attributes": {"category": "article", "title": "..."},
-      "dist": 0.123
+      "score": 0.873
     }
   ],
   "namespace": "default"
@@ -167,6 +172,7 @@ Upsert vectors.
     {
       "id": "doc-123",
       "vector": [0.1, 0.2, 0.3, ...],
+      "text": "full document text for BM25",
       "attributes": {
         "category": "article",
         "title": "My Document"
@@ -180,7 +186,7 @@ Response:
 
 ```json
 {
-  "status": "OK"
+  "status": "ok"
 }
 ```
 
@@ -248,6 +254,15 @@ Health check.
 | `WAL_BATCH_MAX_ENTRIES` | No | `1` | Max WAL entries per batch write (ingest) |
 | `WAL_BATCH_FLUSH_INTERVAL` | No | `0ms` | Max time to wait before flushing WAL batch |
 | `HOT_BUFFER_MAX_SIZE` | No | `10000` | WAL hot buffer size per namespace (query) |
+| `TEXT_INDEX_ENABLED` | No | `true` | Build BM25 text indexes during compaction |
+| `BM25_K1` | No | `1.2` | BM25 term saturation parameter |
+| `BM25_B` | No | `0.75` | BM25 length normalization parameter |
+| `RRF_K` | No | `60` | Reciprocal Rank Fusion (RRF) constant |
+| `TEXT_ENABLE_STEMMING` | No | `true` | Enable stemming in tokenizer |
+| `TEXT_LANGUAGE` | No | `english` | Tokenizer language (stemming rules) |
+| `TEXT_STOPWORDS` | No | - | Comma-separated stopword list (overrides defaults) |
+| `TEXT_MIN_TOKEN_LEN` | No | `2` | Minimum token length |
+| `TEXT_MAX_TOKEN_LEN` | No | `32` | Maximum token length |
 
 ### Quantization Modes
 

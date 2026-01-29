@@ -21,11 +21,13 @@ async fn segment_roundtrip() {
         Document {
             id: "a".to_string(),
             vector: vec![1.0, 2.0],
+            text: None,
             attributes: Some(tag_attr("x")),
         },
         Document {
             id: "b".to_string(),
             vector: vec![3.0, 4.0],
+            text: None,
             attributes: Some(tag_attr("y")),
         },
     ];
@@ -51,11 +53,13 @@ async fn segment_dimension_mismatch() {
         Document {
             id: "a".to_string(),
             vector: vec![1.0, 2.0],
+            text: None,
             attributes: None,
         },
         Document {
             id: "b".to_string(),
             vector: vec![3.0],
+            text: None,
             attributes: None,
         },
     ];

@@ -509,14 +509,14 @@ Query:
 - **Reciprocal Rank Fusion (RRF):** Alternative fusion method
 
 ### Deliverables
-- [ ] `TextIndex` struct with inverted index and document frequencies
-- [ ] Tokenizer with configurable stopwords and stemming
-- [ ] BM25 scorer implementation
-- [ ] Text index serialization format (`.tpti` files)
-- [ ] `text_search()` returning ranked document IDs
-- [ ] `hybrid_search()` combining vector and text results
-- [ ] Fusion methods: linear blend, RRF
-- [ ] Config: `TEXT_INDEX_ENABLED`, `BM25_K1`, `BM25_B`
+- [x] `TextIndex` struct with inverted index and document frequencies
+- [x] Tokenizer with configurable stopwords and stemming
+- [x] BM25 scorer implementation
+- [x] Text index serialization format (`.tpti` files)
+- [x] `text_search()` returning ranked document IDs
+- [x] `hybrid_search()` combining vector and text results
+- [x] Fusion methods: linear blend, RRF
+- [x] Config: `TEXT_INDEX_ENABLED`, `BM25_K1`, `BM25_B`
 
 ### File Format
 ```

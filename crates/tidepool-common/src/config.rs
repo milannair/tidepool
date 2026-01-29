@@ -4,6 +4,7 @@ use std::time::Duration;
 use humantime::parse_duration;
 
 use crate::quantization::QuantizationKind;
+use crate::text::TokenizerConfig;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,6 +41,16 @@ pub struct Config {
     pub wal_batch_flush_interval: Duration,
     // Real-time updates (WAL-based)
     pub hot_buffer_max_size: usize,
+    // Full-text search
+    pub text_index_enabled: bool,
+    pub bm25_k1: f32,
+    pub bm25_b: f32,
+    pub rrf_k: usize,
+    pub text_enable_stemming: bool,
+    pub text_language: String,
+    pub text_stopwords: Option<Vec<String>>,
+    pub text_min_token_len: usize,
+    pub text_max_token_len: usize,
 }
 
 impl Config {
@@ -80,6 +91,16 @@ impl Config {
             wal_batch_flush_interval: parse_duration_fallback("WAL_BATCH_FLUSH_INTERVAL", Duration::from_millis(0)),
             // Real-time updates (WAL-based)
             hot_buffer_max_size: parse_usize("HOT_BUFFER_MAX_SIZE", 10_000),
+            // Full-text search
+            text_index_enabled: parse_bool("TEXT_INDEX_ENABLED", true),
+            bm25_k1: parse_f32("BM25_K1", 1.2),
+            bm25_b: parse_f32("BM25_B", 0.75),
+            rrf_k: parse_usize("RRF_K", 60),
+            text_enable_stemming: parse_bool("TEXT_ENABLE_STEMMING", true),
+            text_language: env::var("TEXT_LANGUAGE").unwrap_or_else(|_| "english".to_string()),
+            text_stopwords: parse_optional_csv("TEXT_STOPWORDS"),
+            text_min_token_len: parse_usize("TEXT_MIN_TOKEN_LEN", 2),
+            text_max_token_len: parse_usize("TEXT_MAX_TOKEN_LEN", 32),
         };
 
         cfg.validate()?;
@@ -103,6 +124,19 @@ impl Config {
             return Err(ConfigError::Missing("AWS_S3_BUCKET_NAME or BUCKET_NAME"));
         }
         Ok(())
+    }
+
+    pub fn tokenizer_config(&self) -> TokenizerConfig {
+        let mut cfg = TokenizerConfig::default()
+            .with_language(self.text_language.clone());
+        cfg.enable_stemming = self.text_enable_stemming;
+        cfg.min_token_len = self.text_min_token_len;
+        cfg.max_token_len = self.text_max_token_len;
+        if let Some(list) = &self.text_stopwords {
+            let set = list.iter().map(|s| s.to_lowercase()).collect();
+            cfg = cfg.with_stopwords(set);
+        }
+        cfg
     }
 }
 

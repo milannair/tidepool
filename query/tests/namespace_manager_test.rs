@@ -15,6 +15,7 @@ async fn namespace_info_pending_compaction() {
         .write_upsert(vec![Document {
             id: "doc-1".to_string(),
             vector: vec![1.0, 2.0],
+            text: None,
             attributes: None,
         }])
         .await
@@ -47,6 +48,7 @@ async fn list_namespaces_includes_manifest_and_wal() {
         .write_segment(&[Document {
             id: "doc-1".to_string(),
             vector: vec![1.0],
+            text: None,
             attributes: None,
         }])
         .await
@@ -67,6 +69,7 @@ async fn list_namespaces_includes_manifest_and_wal() {
         .write_upsert(vec![Document {
             id: "doc-2".to_string(),
             vector: vec![2.0],
+            text: None,
             attributes: None,
         }])
         .await

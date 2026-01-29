@@ -61,6 +61,10 @@ async fn main() {
         EngineOptions {
             hnsw_ef_search: cfg.hnsw_ef_search,
             quantization_rerank_factor: cfg.quantization_rerank_factor,
+            bm25_k1: cfg.bm25_k1,
+            bm25_b: cfg.bm25_b,
+            rrf_k: cfg.rrf_k,
+            tokenizer_config: cfg.tokenizer_config(),
         },
         cfg.hot_buffer_max_size,
         cfg.allowed_namespaces.clone(),
@@ -157,8 +161,37 @@ async fn query(
         }
     };
 
-    if req.vector.is_empty() {
+    let has_vector = !req.vector.is_empty();
+    let has_text = req
+        .text
+        .as_ref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+
+    let mode = match req.mode.as_deref() {
+        Some("vector") => "vector",
+        Some("text") => "text",
+        Some("hybrid") => "hybrid",
+        None => {
+            if has_vector && has_text {
+                "hybrid"
+            } else if has_text {
+                "text"
+            } else {
+                "vector"
+            }
+        }
+        _ => "vector",
+    };
+
+    if mode == "vector" && !has_vector {
         return json_error(StatusCode::BAD_REQUEST, "vector is required");
+    }
+    if mode == "text" && !has_text {
+        return json_error(StatusCode::BAD_REQUEST, "text is required");
+    }
+    if mode == "hybrid" && (!has_vector || !has_text) {
+        return json_error(StatusCode::BAD_REQUEST, "vector and text are required for hybrid");
     }
 
     if req.top_k == 0 {
@@ -173,7 +206,8 @@ async fn query(
     }
 
     let stats = engine.get_stats().await;
-    if stats.dimensions > 0 && req.vector.len() != stats.dimensions {
+    let uses_vector = mode != "text";
+    if uses_vector && stats.dimensions > 0 && req.vector.len() != stats.dimensions {
         return json_error(StatusCode::BAD_REQUEST, "vector dimensions do not match namespace");
     }
 

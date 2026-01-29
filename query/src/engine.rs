@@ -5,13 +5,21 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use tidepool_common::attributes::AttrValue;
 use tidepool_common::document::{QueryRequest, QueryResponse, VectorResult};
 use tidepool_common::manifest::{Manifest, Manager};
 use tidepool_common::segment::{Reader, ReaderOptions, SegmentData};
-use tidepool_common::storage::{segment_index_path, segment_ivf_path, segment_quant_path, Store};
+use tidepool_common::storage::{
+    segment_index_path,
+    segment_ivf_path,
+    segment_quant_path,
+    segment_text_index_path,
+    Store,
+};
 use tidepool_common::tombstone::Manager as TombstoneManager;
 use tidepool_common::vector::DistanceMetric;
 use tidepool_common::wal::Reader as WalReader;
+use tidepool_common::text::{DefaultTokenizer, Tokenizer};
 
 use crate::buffer::HotBuffer;
 
@@ -30,12 +38,20 @@ pub struct Engine<S: Store + Clone> {
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Track the latest WAL entry timestamp we've processed
     last_wal_ts: RwLock<i64>,
+    tokenizer: DefaultTokenizer,
+    bm25_k1: f32,
+    bm25_b: f32,
+    rrf_k: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
     pub hnsw_ef_search: usize,
     pub quantization_rerank_factor: usize,
+    pub bm25_k1: f32,
+    pub bm25_b: f32,
+    pub rrf_k: usize,
+    pub tokenizer_config: tidepool_common::text::TokenizerConfig,
 }
 
 impl Default for EngineOptions {
@@ -43,8 +59,41 @@ impl Default for EngineOptions {
         Self {
             hnsw_ef_search: 0,
             quantization_rerank_factor: 4,
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
+            rrf_k: 60,
+            tokenizer_config: tidepool_common::text::TokenizerConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMode {
+    Vector,
+    Text,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FusionMode {
+    Blend,
+    Rrf,
+}
+
+#[derive(Debug, Clone)]
+struct RawResult {
+    id: String,
+    score: f32,
+    attributes: Option<AttrValue>,
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AccumResult {
+    vec_score: Option<f32>,
+    text_score: Option<f32>,
+    attributes: Option<AttrValue>,
+    vector: Option<Vec<f32>>,
 }
 
 impl<S: Store + Clone + 'static> Engine<S> {
@@ -80,6 +129,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             },
         );
         let wal_reader = WalReader::new(storage.clone(), &namespace);
+        let tokenizer = DefaultTokenizer::new(opts.tokenizer_config.clone());
 
         Self {
             storage: storage.clone(),
@@ -94,6 +144,10 @@ impl<S: Store + Clone + 'static> Engine<S> {
             id_versions: RwLock::new(HashMap::new()),
             hot_buffer,
             last_wal_ts: RwLock::new(0),
+            tokenizer,
+            bm25_k1: opts.bm25_k1,
+            bm25_b: opts.bm25_b,
+            rrf_k: opts.rrf_k.max(1),
         }
     }
 
@@ -322,6 +376,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
                     valid_keys.push(segment_index_path(&self.namespace, &seg.id));
                     valid_keys.push(segment_ivf_path(&self.namespace, &seg.id));
                     valid_keys.push(segment_quant_path(&self.namespace, &seg.id));
+                    valid_keys.push(segment_text_index_path(&self.namespace, &seg.id));
                 }
                 let removed = self.segment_reader.cleanup_cache(&valid_keys).await;
                 if removed > 0 {
@@ -348,13 +403,42 @@ impl<S: Store + Clone + 'static> Engine<S> {
 
         let top_k = if req.top_k == 0 { 10 } else { req.top_k };
         let metric = DistanceMetric::parse(req.distance_metric.as_deref());
+        let mode = parse_mode(req);
+        let fusion = parse_fusion(req);
+        let alpha = req.alpha.unwrap_or(0.7).clamp(0.0, 1.0);
 
-        // Search hot buffer first (if available)
-        let buffer_results = if let Some(buffer) = &self.hot_buffer {
-            buffer.search(&req.vector, top_k * 2, metric).await
+        let has_text = req
+            .text
+            .as_ref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        let tokens = if has_text {
+            self.tokenizer.tokenize(req.text.as_ref().unwrap())
         } else {
             Vec::new()
         };
+
+        let per_segment_k = top_k.saturating_mul(4).max(top_k + 10);
+        let include_vectors = req.include_vectors;
+        let filters = req.filters.clone();
+        let ef_search = req.ef_search;
+        let nprobe = req.nprobe;
+
+        // Search hot buffer (if available)
+        let mut buffer_vec_results = Vec::new();
+        let mut buffer_text_results = Vec::new();
+        if let Some(buffer) = &self.hot_buffer {
+            if mode != QueryMode::Text {
+                buffer_vec_results = buffer
+                    .search(&req.vector, per_segment_k, metric, filters.as_ref(), include_vectors)
+                    .await;
+            }
+            if mode != QueryMode::Vector && !tokens.is_empty() {
+                buffer_text_results = buffer
+                    .text_search(&tokens, per_segment_k, filters.as_ref(), include_vectors)
+                    .await;
+            }
+        }
 
         // Get buffer tombstones
         let buffer_deleted = if let Some(buffer) = &self.hot_buffer {
@@ -364,110 +448,206 @@ impl<S: Store + Clone + 'static> Engine<S> {
         };
 
         // Get IDs in buffer (for deduplication with segments)
-        let buffer_ids: HashSet<String> = buffer_results.iter().map(|r| r.id.clone()).collect();
+        let buffer_ids: HashSet<String> = buffer_vec_results
+            .iter()
+            .chain(buffer_text_results.iter())
+            .map(|r| r.id.clone())
+            .collect();
 
         let manifest = { self.current_manifest.read().await.clone() };
-        
-        // If no manifest or segments, return buffer results only
-        let manifest = match manifest {
-            Some(m) if !m.segments.is_empty() => m,
-            _ => {
-                let mut results = buffer_results;
-                results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
-                results.truncate(top_k);
-                return Ok(QueryResponse {
-                    results,
-                    namespace: self.namespace.clone(),
-                });
-            }
-        };
-
         let segments = { self.loaded_segments.read().await.clone() };
-        let per_segment_k = top_k.saturating_mul(2).max(top_k + 10);
-        let query_vector = req.vector.clone();
-        let filters = req.filters.clone();
-        let include_vectors = req.include_vectors;
-        let ef_search = req.ef_search;
-        let nprobe = req.nprobe;
-        let mut handles = Vec::new();
-        for (seg_index, seg_meta) in manifest.segments.iter().enumerate() {
-            let Some(seg_data) = segments.get(&seg_meta.id) else { continue };
-            let seg_data = Arc::clone(seg_data);
-            let query_vector = query_vector.clone();
-            let filters = filters.clone();
-            let nprobe = nprobe;
-            let handle = tokio::task::spawn_blocking(move || {
-                let max_k = seg_data.len().min(per_segment_k);
-                let results = seg_data.search(&query_vector, max_k, metric, filters.as_ref(), ef_search, nprobe);
-                let mut out = Vec::with_capacity(results.len());
-                for r in results {
-                    let mut result = VectorResult {
-                        id: seg_data.ids[r.index].clone(),
-                        vector: Vec::new(),
-                        attributes: seg_data.attributes[r.index].clone(),
-                        dist: r.dist,
-                    };
-                    if include_vectors {
-                        result.vector = seg_data.vector_owned(r.index).unwrap_or_default();
-                    }
-                    out.push(result);
-                }
-                Ok::<(usize, Vec<VectorResult>), String>((seg_index, out))
-            });
-            handles.push(handle);
-        }
 
-        let mut segment_results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let (seg_index, results) = handle
-                .await
-                .map_err(|err| format!("failed to join query task: {}", err))??;
-            segment_results.push((seg_index, results));
+        let mut segment_results: Vec<(usize, Vec<RawResult>, Vec<RawResult>)> = Vec::new();
+        if let Some(manifest) = manifest.filter(|m| !m.segments.is_empty()) {
+            let mut handles = Vec::new();
+            let tokens = Arc::new(tokens.clone());
+            let bm25_k1 = self.bm25_k1;
+            let bm25_b = self.bm25_b;
+            for (seg_index, seg_meta) in manifest.segments.iter().enumerate() {
+                let Some(seg_data) = segments.get(&seg_meta.id) else { continue };
+                let seg_data = Arc::clone(seg_data);
+                let query_vector = req.vector.clone();
+                let filters = filters.clone();
+                let tokens: Arc<Vec<String>> = Arc::clone(&tokens);
+                let handle = tokio::task::spawn_blocking(move || {
+                    let mut vec_out = Vec::new();
+                    let mut text_out = Vec::new();
+                    let max_k = seg_data.len().min(per_segment_k);
+
+                    if mode != QueryMode::Text {
+                        let results =
+                            seg_data.search(&query_vector, max_k, metric, filters.as_ref(), ef_search, nprobe);
+                        vec_out.reserve(results.len());
+                        for r in results {
+                            let mut vector = None;
+                            if include_vectors {
+                                vector = Some(seg_data.vector_owned(r.index).unwrap_or_default());
+                            }
+                            vec_out.push(RawResult {
+                                id: seg_data.ids[r.index].clone(),
+                                score: distance_to_score(r.dist),
+                                attributes: seg_data.attributes[r.index].clone(),
+                                vector,
+                            });
+                        }
+                    }
+
+                    if mode != QueryMode::Vector && !tokens.is_empty() {
+                        let results =
+                            seg_data.text_search(tokens.as_ref(), max_k, filters.as_ref(), bm25_k1, bm25_b);
+                        text_out.reserve(results.len());
+                        for r in results {
+                            let mut vector = None;
+                            if include_vectors {
+                                vector = Some(seg_data.vector_owned(r.index).unwrap_or_default());
+                            }
+                            text_out.push(RawResult {
+                                id: seg_data.ids[r.index].clone(),
+                                score: r.score,
+                                attributes: seg_data.attributes[r.index].clone(),
+                                vector,
+                            });
+                        }
+                    }
+
+                    Ok::<(usize, Vec<RawResult>, Vec<RawResult>), String>((seg_index, vec_out, text_out))
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let (seg_index, vec_out, text_out) = handle
+                    .await
+                    .map_err(|err| format!("failed to join query task: {}", err))??;
+                segment_results.push((seg_index, vec_out, text_out));
+            }
         }
 
         let tombstones = self.tombstones.read().await;
         let id_versions = self.id_versions.read().await;
-        let mut all_results = Vec::new();
-        
-        // Add segment results, filtering out:
-        // - Tombstoned IDs (from S3 tombstones)
-        // - IDs deleted in buffer
-        // - IDs that exist in buffer (buffer version is fresher)
-        // - Duplicate IDs from older segments
-        for (seg_index, mut results) in segment_results {
-            results.retain(|r| {
-                // Skip if in S3 tombstones
-                if tombstones.contains(&r.id) {
-                    return false;
+
+        let mut accum: HashMap<String, AccumResult> = HashMap::new();
+
+        for (seg_index, vec_out, text_out) in segment_results {
+            for r in vec_out {
+                if tombstones.contains(&r.id)
+                    || buffer_deleted.contains(&r.id)
+                    || buffer_ids.contains(&r.id)
+                    || match id_versions.get(&r.id) {
+                        Some(&latest) => latest != seg_index,
+                        None => false,
+                    }
+                {
+                    continue;
                 }
-                // Skip if deleted in buffer
-                if buffer_deleted.contains(&r.id) {
-                    return false;
+                let entry = accum.entry(r.id.clone()).or_default();
+                entry.vec_score = Some(r.score);
+                if entry.attributes.is_none() {
+                    entry.attributes = r.attributes.clone();
                 }
-                // Skip if exists in buffer (buffer has fresher version)
-                if buffer_ids.contains(&r.id) {
-                    return false;
+                if include_vectors && entry.vector.is_none() {
+                    entry.vector = r.vector.clone();
                 }
-                // Skip if not latest segment version
-                match id_versions.get(&r.id) {
-                    Some(&latest) => latest == seg_index,
-                    None => true,
+            }
+
+            for r in text_out {
+                if tombstones.contains(&r.id)
+                    || buffer_deleted.contains(&r.id)
+                    || buffer_ids.contains(&r.id)
+                    || match id_versions.get(&r.id) {
+                        Some(&latest) => latest != seg_index,
+                        None => false,
+                    }
+                {
+                    continue;
                 }
-            });
-            all_results.extend(results);
+                let entry = accum.entry(r.id.clone()).or_default();
+                entry.text_score = Some(r.score);
+                if entry.attributes.is_none() {
+                    entry.attributes = r.attributes.clone();
+                }
+                if include_vectors && entry.vector.is_none() {
+                    entry.vector = r.vector.clone();
+                }
+            }
         }
 
-        // Add buffer results (already filtered for buffer tombstones)
-        all_results.extend(buffer_results);
+        // Buffer results override segment results
+        for r in buffer_vec_results {
+            let entry = accum.entry(r.id.clone()).or_default();
+            entry.vec_score = Some(r.score);
+            entry.attributes = r.attributes.clone();
+            if include_vectors && !r.vector.is_empty() {
+                entry.vector = Some(r.vector.clone());
+            }
+        }
 
-        // Sort and truncate
-        all_results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
-        if all_results.len() > top_k {
-            all_results.truncate(top_k);
+        for r in buffer_text_results {
+            let entry = accum.entry(r.id.clone()).or_default();
+            entry.text_score = Some(r.score);
+            entry.attributes = r.attributes.clone();
+            if include_vectors && !r.vector.is_empty() {
+                entry.vector = Some(r.vector.clone());
+            }
+        }
+
+        let mut vec_scores: HashMap<String, f32> = HashMap::new();
+        let mut text_scores: HashMap<String, f32> = HashMap::new();
+        for (id, acc) in &accum {
+            if let Some(score) = acc.vec_score {
+                vec_scores.insert(id.clone(), score);
+            }
+            if let Some(score) = acc.text_score {
+                text_scores.insert(id.clone(), score);
+            }
+        }
+
+        let final_scores: HashMap<String, f32> = match mode {
+            QueryMode::Vector => vec_scores,
+            QueryMode::Text => normalize_scores(&text_scores),
+            QueryMode::Hybrid => match fusion {
+                FusionMode::Blend => {
+                    let vec_norm = normalize_scores(&vec_scores);
+                    let text_norm = normalize_scores(&text_scores);
+                    let mut fused = HashMap::new();
+                    for id in vec_norm.keys().chain(text_norm.keys()) {
+                        let vs = vec_norm.get(id).copied().unwrap_or(0.0);
+                        let ts = text_norm.get(id).copied().unwrap_or(0.0);
+                        fused.insert(id.clone(), alpha * vs + (1.0 - alpha) * ts);
+                    }
+                    fused
+                }
+                FusionMode::Rrf => {
+                    let rrf_k = req.rrf_k.map(|v| v as usize).unwrap_or(self.rrf_k);
+                    rrf_fuse(&vec_scores, &text_scores, rrf_k)
+                }
+            },
+        };
+
+        let mut results: Vec<VectorResult> = final_scores
+            .into_iter()
+            .filter_map(|(id, score)| {
+                let acc = accum.get(&id)?;
+                Some(VectorResult {
+                    id,
+                    score,
+                    attributes: acc.attributes.clone(),
+                    vector: if include_vectors {
+                        acc.vector.clone().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        if results.len() > top_k {
+            results.truncate(top_k);
         }
 
         Ok(QueryResponse {
-            results: all_results,
+            results,
             namespace: self.namespace.clone(),
         })
     }
@@ -535,6 +715,83 @@ impl<S: Store + Clone + 'static> Engine<S> {
         let mut manifest = self.current_manifest.write().await;
         *manifest = None;
     }
+}
+
+fn parse_mode(req: &QueryRequest) -> QueryMode {
+    let has_vector = !req.vector.is_empty();
+    let has_text = req
+        .text
+        .as_ref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+
+    match req.mode.as_deref() {
+        Some("vector") => QueryMode::Vector,
+        Some("text") => QueryMode::Text,
+        Some("hybrid") => QueryMode::Hybrid,
+        _ => {
+            if has_vector && has_text {
+                QueryMode::Hybrid
+            } else if has_text {
+                QueryMode::Text
+            } else {
+                QueryMode::Vector
+            }
+        }
+    }
+}
+
+fn parse_fusion(req: &QueryRequest) -> FusionMode {
+    match req.fusion.as_deref() {
+        Some("rrf") => FusionMode::Rrf,
+        _ => FusionMode::Blend,
+    }
+}
+
+fn distance_to_score(dist: f32) -> f32 {
+    if dist.is_finite() {
+        1.0 / (1.0 + dist)
+    } else {
+        0.0
+    }
+}
+
+fn normalize_scores(scores: &HashMap<String, f32>) -> HashMap<String, f32> {
+    if scores.is_empty() {
+        return HashMap::new();
+    }
+    let max = scores
+        .values()
+        .fold(0.0_f32, |acc, v| if *v > acc { *v } else { acc });
+    if max <= 0.0 {
+        return scores.iter().map(|(k, _)| (k.clone(), 0.0)).collect();
+    }
+    scores.iter().map(|(k, v)| (k.clone(), v / max)).collect()
+}
+
+fn rrf_fuse(
+    vec_scores: &HashMap<String, f32>,
+    text_scores: &HashMap<String, f32>,
+    rrf_k: usize,
+) -> HashMap<String, f32> {
+    let mut fused = HashMap::new();
+    let rrf_k = rrf_k.max(1) as f32;
+
+    let mut vec_sorted: Vec<(String, f32)> = vec_scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    vec_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (id, _)) in vec_sorted.into_iter().enumerate() {
+        let score = 1.0 / (rrf_k + (rank + 1) as f32);
+        *fused.entry(id).or_insert(0.0) += score;
+    }
+
+    let mut text_sorted: Vec<(String, f32)> = text_scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    text_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (id, _)) in text_sorted.into_iter().enumerate() {
+        let score = 1.0 / (rrf_k + (rank + 1) as f32);
+        *fused.entry(id).or_insert(0.0) += score;
+    }
+
+    fused
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

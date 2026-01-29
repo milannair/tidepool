@@ -25,6 +25,8 @@ byteorder = "1"
 memmap2 = "0.9"
 uuid = { version = "1", features = ["v4"] }
 half = "2"
+unicode-segmentation = "1"
+rust-stemmers = "1"
 
 [dev-dependencies]
 criterion = "0.5"
