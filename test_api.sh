@@ -307,13 +307,13 @@ status=$(echo "$response" | tail -n1)
 body=$(echo "$response" | sed '$d')
 run_test "Reject empty vector" 400 "$status" "$body"
 
-# Test 3.4: Invalid JSON
+# Test 3.4: Invalid JSON (syntax error returns 400, data error returns 422)
 response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$NAMESPACE" \
     -H "Content-Type: application/json" \
     -d 'not valid json')
 status=$(echo "$response" | tail -n1)
 body=$(echo "$response" | sed '$d')
-run_test "Reject invalid JSON" 422 "$status" "$body" || run_test "Reject invalid JSON (alt)" 400 "$status" "$body" || true
+run_test "Reject invalid JSON" 400 "$status" "$body"
 
 # Test 3.5: Missing id field
 response=$(curl -s -w "\n%{http_code}" -X POST "$INGEST_URL/v1/vectors/$NAMESPACE" \
