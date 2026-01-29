@@ -15,18 +15,15 @@ use tidepool_common::config::Config;
 use tidepool_common::document::{DeleteRequest, DeleteResponse, UpsertRequest, UpsertResponse};
 use tidepool_common::segment::WriterOptions;
 use tidepool_common::storage::S3Store;
-use tidepool_common::wal::Writer as WalWriter;
 
 mod compactor;
-use compactor::Compactor;
+mod namespace_manager;
+use namespace_manager::{NamespaceError, NamespaceManager};
 mod wal_buffer;
-use wal_buffer::BufferedWalWriter;
 
 #[derive(Clone)]
 struct AppState {
-    wal_writer: Arc<BufferedWalWriter<S3Store>>,
-    compactor: Arc<Compactor<S3Store>>,
-    namespace: String,
+    namespaces: Arc<NamespaceManager<S3Store>>,
 }
 
 #[tokio::main]
@@ -53,43 +50,36 @@ async fn main() {
         }
     };
 
-    let wal_writer = BufferedWalWriter::new(
-        WalWriter::new(storage.clone(), cfg.namespace.clone()),
-        cfg.wal_batch_max_entries,
-        cfg.wal_batch_flush_interval,
-    );
-    let compactor = Compactor::new_with_options(
-        storage,
-        cfg.namespace.clone(),
-        WriterOptions {
-            hnsw_m: cfg.hnsw_m,
-            hnsw_ef_construction: cfg.hnsw_ef_construction,
-            hnsw_ef_search: cfg.hnsw_ef_search,
-            metric: tidepool_common::vector::DistanceMetric::Cosine,
-            use_v2_format: true,
-            ivf_enabled: cfg.ivf_enabled,
-            ivf_min_segment_size: cfg.ivf_min_segment_size,
-            ivf_k_factor: cfg.ivf_k_factor,
-            ivf_min_k: cfg.ivf_min_k,
-            ivf_max_k: cfg.ivf_max_k,
-            ivf_nprobe_default: cfg.ivf_nprobe_default,
-            quantization: cfg.quantization,
-            ..WriterOptions::default()
-        },
-    );
-
-    let compactor_task = {
-        let compactor = compactor.clone();
-        let interval = cfg.compaction_interval;
-        tokio::spawn(async move {
-            compactor.run_periodically(interval).await;
-        })
+    let writer_options = WriterOptions {
+        hnsw_m: cfg.hnsw_m,
+        hnsw_ef_construction: cfg.hnsw_ef_construction,
+        hnsw_ef_search: cfg.hnsw_ef_search,
+        metric: tidepool_common::vector::DistanceMetric::Cosine,
+        use_v2_format: true,
+        ivf_enabled: cfg.ivf_enabled,
+        ivf_min_segment_size: cfg.ivf_min_segment_size,
+        ivf_k_factor: cfg.ivf_k_factor,
+        ivf_min_k: cfg.ivf_min_k,
+        ivf_max_k: cfg.ivf_max_k,
+        ivf_nprobe_default: cfg.ivf_nprobe_default,
+        quantization: cfg.quantization,
+        ..WriterOptions::default()
     };
 
+    let namespaces = Arc::new(NamespaceManager::new(
+        storage,
+        writer_options,
+        cfg.wal_batch_max_entries,
+        cfg.wal_batch_flush_interval,
+        cfg.compaction_interval,
+        cfg.allowed_namespaces.clone(),
+        cfg.max_namespaces,
+        cfg.namespace_idle_timeout,
+        cfg.namespace.clone(),
+    ));
+
     let state = AppState {
-        wal_writer: Arc::new(wal_writer),
-        compactor: Arc::new(compactor),
-        namespace: cfg.namespace.clone(),
+        namespaces: namespaces.clone(),
     };
 
     let cors = if cfg.cors_allow_origin == "*" {
@@ -107,6 +97,8 @@ async fn main() {
         .route("/status", get(status))
         .route("/compact", post(compact))
         .route("/v1/namespaces/:namespace", post(upsert).delete(delete_vectors))
+        .route("/v1/namespaces/:namespace/status", get(status_namespace))
+        .route("/v1/namespaces/:namespace/compact", post(compact_namespace))
         .route("/v1/vectors/:namespace", post(upsert).delete(delete_vectors))
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(cfg.max_body_bytes))
@@ -125,8 +117,7 @@ async fn main() {
             info!("Shutting down...");
         }
     }
-
-    compactor_task.abort();
+    namespaces.shutdown().await;
 }
 
 async fn health() -> impl IntoResponse {
@@ -137,14 +128,54 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>) -> Response {
-    match state.compactor.get_status().await {
+    let Some(namespace) = state.namespaces.fixed_namespace() else {
+        return json_error(StatusCode::BAD_REQUEST, "namespace required");
+    };
+    status_namespace(Path(namespace.to_string()), State(state)).await
+}
+
+async fn compact(State(state): State<AppState>) -> Response {
+    let _ = state;
+    json_error(StatusCode::BAD_REQUEST, "namespace required")
+}
+
+async fn status_namespace(
+    Path(namespace): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let handle = match state.namespaces.get_or_create(&namespace).await {
+        Ok(handle) => handle,
+        Err(NamespaceError::NotAllowed) => {
+            return json_error(StatusCode::NOT_FOUND, "namespace not found");
+        }
+        Err(err) => {
+            error!("Namespace error: {}", err);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "namespace error");
+        }
+    };
+
+    match handle.compactor.get_status().await {
         Ok(status) => Json(status).into_response(),
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to get status"),
     }
 }
 
-async fn compact(State(state): State<AppState>) -> Response {
-    match state.compactor.run().await {
+async fn compact_namespace(
+    Path(namespace): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let handle = match state.namespaces.get_or_create(&namespace).await {
+        Ok(handle) => handle,
+        Err(NamespaceError::NotAllowed) => {
+            return json_error(StatusCode::NOT_FOUND, "namespace not found");
+        }
+        Err(err) => {
+            error!("Namespace error: {}", err);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "namespace error");
+        }
+    };
+
+    match handle.compactor.run().await {
         Ok(_) => Json(serde_json::json!({"status": "compaction completed"})).into_response(),
         Err(err) => {
             error!("Manual compaction error: {}", err);
@@ -158,16 +189,23 @@ async fn upsert(
     State(state): State<AppState>,
     Json(req): Json<UpsertRequest>,
 ) -> Response {
-    if namespace != state.namespace {
-        return json_error(StatusCode::NOT_FOUND, "namespace not found");
-    }
+    let handle = match state.namespaces.get_or_create(&namespace).await {
+        Ok(handle) => handle,
+        Err(NamespaceError::NotAllowed) => {
+            return json_error(StatusCode::NOT_FOUND, "namespace not found");
+        }
+        Err(err) => {
+            error!("Namespace error: {}", err);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "namespace error");
+        }
+    };
 
     if req.vectors.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "vectors are required");
     }
 
     // Write to WAL for durability (query nodes will scan WAL for real-time visibility)
-    if let Err(err) = state.wal_writer.write_upsert(req.vectors.clone()).await {
+    if let Err(err) = handle.wal_writer.write_upsert(req.vectors.clone()).await {
         error!("Upsert error: {}", err);
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "upsert failed");
     }
@@ -180,16 +218,23 @@ async fn delete_vectors(
     State(state): State<AppState>,
     Json(req): Json<DeleteRequest>,
 ) -> Response {
-    if namespace != state.namespace {
-        return json_error(StatusCode::NOT_FOUND, "namespace not found");
-    }
+    let handle = match state.namespaces.get_or_create(&namespace).await {
+        Ok(handle) => handle,
+        Err(NamespaceError::NotAllowed) => {
+            return json_error(StatusCode::NOT_FOUND, "namespace not found");
+        }
+        Err(err) => {
+            error!("Namespace error: {}", err);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "namespace error");
+        }
+    };
 
     if req.ids.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "ids are required");
     }
 
     // Write to WAL for durability (query nodes will scan WAL for real-time visibility)
-    if let Err(err) = state.wal_writer.write_delete(req.ids.clone()).await {
+    if let Err(err) = handle.wal_writer.write_delete(req.ids.clone()).await {
         error!("Delete error: {}", err);
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "delete failed");
     }

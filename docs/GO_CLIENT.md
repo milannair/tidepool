@@ -368,15 +368,15 @@ fmt.Println(namespaces) // ["default", "embeddings"]
 ### Get Ingest Status
 
 ```go
-// Status returns ingest service status
-func (c *Client) Status(ctx context.Context) (*IngestStatus, error)
+// Status returns ingest service status for a namespace
+func (c *Client) Status(ctx context.Context, namespace string) (*IngestStatus, error)
 ```
 
-**HTTP:** `GET /status`
+**HTTP:** `GET /v1/namespaces/{namespace}/status`
 
 **Example:**
 ```go
-status, err := client.Status(ctx)
+status, err := client.Status(ctx, "default")
 if err != nil {
     log.Fatal(err)
 }
@@ -389,14 +389,14 @@ fmt.Printf("WAL entries: %d, Segments: %d\n", status.WALEntries, status.Segments
 
 ```go
 // Compact triggers manual compaction
-func (c *Client) Compact(ctx context.Context) error
+func (c *Client) Compact(ctx context.Context, namespace string) error
 ```
 
-**HTTP:** `POST /compact`
+**HTTP:** `POST /v1/namespaces/{namespace}/compact`
 
 **Example:**
 ```go
-err := client.Compact(ctx)
+err := client.Compact(ctx, "default")
 if err != nil {
     log.Fatal(err)
 }
@@ -504,7 +504,7 @@ func main() {
     }
 
     // Trigger compaction
-    if err := client.Compact(ctx); err != nil {
+    if err := client.Compact(ctx, "default"); err != nil {
         log.Fatal(err)
     }
 
@@ -563,7 +563,7 @@ func uploadBatch(ctx context.Context, client *tidepool.Client, docs []tidepool.D
         return err
     }
 
-    return client.Compact(ctx)
+    return client.Compact(ctx, "default")
 }
 ```
 

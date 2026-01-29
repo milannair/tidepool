@@ -11,15 +11,14 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info};
 
 use tidepool_common::config::Config;
-use tidepool_common::document::{NamespaceInfo, QueryRequest};
+use tidepool_common::document::QueryRequest;
 use tidepool_common::storage::S3Store;
-use tidepool_query::buffer::HotBuffer;
-use tidepool_query::engine::{Engine, EngineOptions};
+use tidepool_query::engine::EngineOptions;
+use tidepool_query::namespace_manager::{NamespaceError, NamespaceManager};
 
 #[derive(Clone)]
 struct AppState {
-    engine: Arc<Engine<S3Store>>,
-    namespace: String,
+    namespaces: Arc<NamespaceManager<S3Store>>,
     max_top_k: usize,
 }
 
@@ -47,34 +46,31 @@ async fn main() {
         }
     };
 
-    // Create hot buffer for WAL-based real-time updates
-    // The engine will scan WAL files from S3 to populate this buffer
-    let hot_buffer = if cfg.hot_buffer_max_size > 0 {
-        info!("Real-time updates enabled via WAL scanning (buffer size: {})", cfg.hot_buffer_max_size);
-        Some(Arc::new(HotBuffer::new(cfg.hot_buffer_max_size)))
+    if cfg.hot_buffer_max_size > 0 {
+        info!(
+            "Real-time updates enabled via WAL scanning (buffer size per namespace: {})",
+            cfg.hot_buffer_max_size
+        );
     } else {
         info!("Real-time updates disabled (HOT_BUFFER_MAX_SIZE=0)");
-        None
-    };
+    }
 
-    let engine = Engine::new_with_buffer(
+    let namespaces = NamespaceManager::new(
         storage,
-        cfg.namespace.clone(),
         Some(cfg.cache_dir.clone()),
         EngineOptions {
             hnsw_ef_search: cfg.hnsw_ef_search,
             quantization_rerank_factor: cfg.quantization_rerank_factor,
         },
-        hot_buffer.clone(),
+        cfg.hot_buffer_max_size,
+        cfg.allowed_namespaces.clone(),
+        cfg.max_namespaces,
+        cfg.namespace_idle_timeout,
+        cfg.namespace.clone(),
     );
 
-    if let Err(err) = engine.load_manifest().await {
-        info!("Warning: failed to load initial manifest: {}", err);
-    }
-
     let state = AppState {
-        engine: Arc::new(engine),
-        namespace: cfg.namespace.clone(),
+        namespaces: Arc::new(namespaces),
         max_top_k: cfg.max_top_k,
     };
 
@@ -125,26 +121,24 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn list_namespaces(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.engine.get_stats().await;
-    let namespaces = vec![NamespaceInfo {
-        namespace: state.namespace.clone(),
-        approx_count: stats.total_vectors,
-        dimensions: stats.dimensions,
-    }];
-    Json(serde_json::json!({"namespaces": namespaces}))
+    match state.namespaces.list_namespaces().await {
+        Ok(namespaces) => Json(serde_json::json!({"namespaces": namespaces})).into_response(),
+        Err(err) => {
+            error!("List namespaces error: {}", err);
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to list namespaces")
+        }
+    }
 }
 
 async fn get_namespace(Path(namespace): Path<String>, State(state): State<AppState>) -> Response {
-    if namespace != state.namespace {
-        return json_error(StatusCode::NOT_FOUND, "namespace not found");
+    match state.namespaces.get_namespace_info(&namespace).await {
+        Ok(info) => Json(info).into_response(),
+        Err(NamespaceError::NotAllowed) => json_error(StatusCode::NOT_FOUND, "namespace not found"),
+        Err(err) => {
+            error!("Get namespace error: {}", err);
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to get namespace")
+        }
     }
-    let stats = state.engine.get_stats().await;
-    let info = NamespaceInfo {
-        namespace: state.namespace.clone(),
-        approx_count: stats.total_vectors,
-        dimensions: stats.dimensions,
-    };
-    Json(info).into_response()
 }
 
 async fn query(
@@ -152,9 +146,16 @@ async fn query(
     State(state): State<AppState>,
     Json(mut req): Json<QueryRequest>,
 ) -> Response {
-    if namespace != state.namespace {
-        return json_error(StatusCode::NOT_FOUND, "namespace not found");
-    }
+    let engine = match state.namespaces.get_engine(&namespace).await {
+        Ok(engine) => engine,
+        Err(NamespaceError::NotAllowed) => {
+            return json_error(StatusCode::NOT_FOUND, "namespace not found");
+        }
+        Err(err) => {
+            error!("Namespace error: {}", err);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "namespace error");
+        }
+    };
 
     if req.vector.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "vector is required");
@@ -171,12 +172,12 @@ async fn query(
         req.ef_search = 0;
     }
 
-    let stats = state.engine.get_stats().await;
+    let stats = engine.get_stats().await;
     if stats.dimensions > 0 && req.vector.len() != stats.dimensions {
         return json_error(StatusCode::BAD_REQUEST, "vector dimensions do not match namespace");
     }
 
-    match state.engine.query(&req).await {
+    match engine.query(&req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => {
             error!("Query error: {}", err);

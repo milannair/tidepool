@@ -416,7 +416,7 @@ def list_namespaces(self) -> List[str]:
 Get compaction and WAL status from the ingest service.
 
 **Service:** Ingest  
-**Endpoint:** `GET /status`
+**Endpoint:** `GET /v1/namespaces/{namespace}/status`
 
 **Response:**
 ```json
@@ -432,9 +432,9 @@ Get compaction and WAL status from the ingest service.
 
 **Python Method:**
 ```python
-def status(self) -> IngestStatus:
+def status(self, namespace: Optional[str] = None) -> IngestStatus:
     """
-    Get ingest service status.
+    Get ingest service status for a namespace.
     
     Returns:
         IngestStatus with compaction info
@@ -457,7 +457,7 @@ class IngestStatus:
 Manually trigger compaction. Useful for testing or after large batch uploads.
 
 **Service:** Ingest  
-**Endpoint:** `POST /compact`
+**Endpoint:** `POST /v1/namespaces/{namespace}/compact`
 
 **Response:**
 ```json
@@ -468,7 +468,7 @@ Manually trigger compaction. Useful for testing or after large batch uploads.
 
 **Python Method:**
 ```python
-def compact(self) -> None:
+def compact(self, namespace: Optional[str] = None) -> None:
     """
     Trigger manual compaction.
     
@@ -554,7 +554,7 @@ documents = [
 client.upsert(documents)
 
 # Wait for compaction or trigger manually
-client.compact()
+client.compact(namespace="default")
 
 # Query
 results = client.query(
@@ -588,7 +588,7 @@ for i in range(0, len(all_documents), BATCH_SIZE):
     client.upsert(batch)
 
 # Trigger compaction after large upload
-client.compact()
+client.compact(namespace="default")
 ```
 
 ### Async Client (Optional)

@@ -113,4 +113,6 @@ pub struct NamespaceInfo {
     pub namespace: String,
     pub approx_count: i64,
     pub dimensions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_compaction: Option<bool>,
 }

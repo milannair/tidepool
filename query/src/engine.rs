@@ -28,8 +28,8 @@ pub struct Engine<S: Store + Clone> {
     tombstones: RwLock<HashSet<String>>,
     id_versions: RwLock<HashMap<String, usize>>,
     hot_buffer: Option<Arc<HotBuffer>>,
-    /// Track which WAL files have been scanned
-    scanned_wal_files: RwLock<HashSet<String>>,
+    /// Track the latest WAL entry timestamp we've processed
+    last_wal_ts: RwLock<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +93,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             tombstones: RwLock::new(HashSet::new()),
             id_versions: RwLock::new(HashMap::new()),
             hot_buffer,
-            scanned_wal_files: RwLock::new(HashSet::new()),
+            last_wal_ts: RwLock::new(0),
         }
     }
 
@@ -200,19 +200,22 @@ impl<S: Store + Clone + 'static> Engine<S> {
     }
 
     /// Scan WAL files from S3 and populate the hot buffer.
-    /// Only scans files newer than the current manifest (not yet compacted).
+    /// Uses timestamp-based tracking to ensure new entries are always picked up.
     async fn scan_wal(&self) {
         let Some(buffer) = &self.hot_buffer else {
             return;
         };
 
-        // Get manifest watermark (files created before this are already in segments)
+        // Get manifest watermark (entries before this are already in segments)
         let manifest_created_at = {
             let manifest = self.current_manifest.read().await;
             manifest.as_ref().map(|m| m.created_at).unwrap_or(0)
         };
 
-        // List all WAL files
+        // Get the last processed timestamp
+        let last_ts = *self.last_wal_ts.read().await;
+
+        // List all WAL files (always re-list to catch new files)
         let wal_files = match self.wal_reader.list_wal_files().await {
             Ok(files) => files,
             Err(err) => {
@@ -221,30 +224,32 @@ impl<S: Store + Clone + 'static> Engine<S> {
             }
         };
 
-        // Filter to unscanned files
-        let scanned = self.scanned_wal_files.read().await;
-        let new_files: Vec<_> = wal_files
-            .into_iter()
-            .filter(|f| !scanned.contains(f))
-            .collect();
-        drop(scanned);
-
-        if new_files.is_empty() {
+        if wal_files.is_empty() {
             return;
         }
 
-        // Read new WAL files and extract entries
+        // Read all WAL files and extract entries newer than last_ts
         let mut docs_to_insert = Vec::new();
         let mut ids_to_delete = Vec::new();
-        let mut successfully_scanned = Vec::new();
+        let mut max_ts = last_ts;
 
-        for wal_file in new_files {
+        for wal_file in wal_files {
             match self.wal_reader.read_wal_file(&wal_file).await {
                 Ok(entries) => {
                     for entry in entries {
-                        // Only process entries newer than manifest
+                        // Skip entries already in segments (compacted)
                         if entry.ts <= manifest_created_at {
                             continue;
+                        }
+
+                        // Skip entries we've already processed
+                        if entry.ts <= last_ts {
+                            continue;
+                        }
+
+                        // Track max timestamp
+                        if entry.ts > max_ts {
+                            max_ts = entry.ts;
                         }
 
                         match entry.op.as_str() {
@@ -259,7 +264,6 @@ impl<S: Store + Clone + 'static> Engine<S> {
                             _ => {}
                         }
                     }
-                    successfully_scanned.push(wal_file);
                 }
                 Err(err) => {
                     warn!("Failed to read WAL file: {}", err);
@@ -267,7 +271,7 @@ impl<S: Store + Clone + 'static> Engine<S> {
             }
         }
 
-        // Update buffer
+        // Update buffer with new entries
         if !docs_to_insert.is_empty() {
             let count = docs_to_insert.len();
             buffer.insert(docs_to_insert).await;
@@ -280,28 +284,24 @@ impl<S: Store + Clone + 'static> Engine<S> {
             info!("WAL scan: applied {} deletes to hot buffer", count);
         }
 
-        // Mark files as scanned
-        let mut scanned = self.scanned_wal_files.write().await;
-        for file in successfully_scanned {
-            scanned.insert(file);
+        // Update last processed timestamp
+        if max_ts > last_ts {
+            let mut ts = self.last_wal_ts.write().await;
+            *ts = max_ts;
         }
     }
 
-    /// Clear scanned WAL files that have been compacted.
-    /// Called when manifest changes to avoid growing the set indefinitely.
-    async fn clear_compacted_wal_files(&self) {
-        let wal_files = match self.wal_reader.list_wal_files().await {
-            Ok(files) => files.into_iter().collect::<HashSet<_>>(),
-            Err(_) => return,
-        };
-
-        // Remove entries for WAL files that no longer exist (were compacted/deleted)
-        let mut scanned = self.scanned_wal_files.write().await;
-        scanned.retain(|f| wal_files.contains(f));
+    /// Reset WAL tracking and clear buffer when manifest changes.
+    /// Compacted data is now in segments, so buffer should be cleared.
+    async fn reset_wal_state(&self) {
+        // Reset WAL timestamp tracking (will rescan from manifest watermark)
+        {
+            let mut ts = self.last_wal_ts.write().await;
+            *ts = 0;
+        }
 
         // Clear buffer when manifest changes (compacted data now in segments)
         if let Some(buffer) = &self.hot_buffer {
-            // Get new manifest version as u64
             let manifest = self.current_manifest.read().await;
             if let Some(m) = manifest.as_ref() {
                 if let Ok(version) = m.version.parse::<u64>() {
@@ -328,8 +328,8 @@ impl<S: Store + Clone + 'static> Engine<S> {
                     info!("Cache cleanup: removed {} stale files", removed);
                 }
             }
-            // Clear WAL tracking when manifest changes (data now in segments)
-            self.clear_compacted_wal_files().await;
+            // Reset WAL state when manifest changes (data now in segments)
+            self.reset_wal_state().await;
         }
         let _ = self.ensure_segments_loaded().await;
         if changed || self.id_versions.read().await.is_empty() {
