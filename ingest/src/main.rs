@@ -203,15 +203,19 @@ async fn upsert(
     };
 
     if req.vectors.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "vectors are required");
+        return json_error(StatusCode::BAD_REQUEST, "vectors array is required and cannot be empty");
     }
 
-    // Validate each document has a non-empty vector
+    // Validate each document has a non-empty vector (required for indexing)
+    // Text field is optional and used for hybrid search when present
     for (i, doc) in req.vectors.iter().enumerate() {
         if doc.vector.is_empty() {
             return json_error(
                 StatusCode::BAD_REQUEST,
-                &format!("document at index {} is missing required 'vector' field", i),
+                &format!(
+                    "document at index {} is missing required 'vector' field (text-only documents are not yet supported)",
+                    i
+                ),
             );
         }
     }
