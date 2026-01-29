@@ -2,9 +2,9 @@
 //!
 //! Layout:
 //! ```text
-//! [Header: 68 bytes]
-//!   magic: [u8; 4] = "TPV2"
-//!   version: u32 = 2
+//! [Header: 68 bytes (v2) / 84 bytes (v3)]
+//!   magic: [u8; 4] = "TPV2" | "TPV3"
+//!   version: u32 = 2 | 3
 //!   vector_count: u32
 //!   dimensions: u32
 //!   flags: u32
@@ -15,12 +15,14 @@
 //!   string_table_offset: u64
 //!   attr_offset: u64
 //!   attr_len: u64
-//!   _reserved: [u8; 8]
+//!   text_offset: u64 (v3 only)
+//!   text_len: u64 (v3 only)
 //! [Norms: f32 × n, 32-byte aligned]
 //! [Vectors: f32 × n × d, 32-byte aligned]
 //! [IDs: u64 × n]
 //! [String table: length-prefixed strings]
 //! [Attributes: rkyv archived]
+//! [Text table: length-prefixed strings] (v3 only)
 //! ```
 
 use std::collections::hash_map::DefaultHasher;
@@ -44,11 +46,14 @@ use crate::vector::DistanceMetric;
 /// Alignment for vector data (AVX2 friendly)
 const ALIGNMENT: usize = 32;
 
-/// Segment header size (must match actual written size)
-const HEADER_SIZE: usize = 68;
+/// Segment header sizes (must match actual written size)
+const HEADER_SIZE_V2: usize = 68;
+const HEADER_SIZE_V3: usize = 84;
 
 /// Magic bytes for v2 format
 const MAGIC_V2: &[u8; 4] = b"TPV2";
+/// Magic bytes for v3 format
+const MAGIC_V3: &[u8; 4] = b"TPV3";
 
 /// Segment flags
 pub mod flags {
@@ -85,6 +90,8 @@ pub struct SegmentHeader {
     pub string_table_offset: u64,
     pub attr_offset: u64,
     pub attr_len: u64,
+    pub text_offset: u64,
+    pub text_len: u64,
 }
 
 /// Parsed layout for segment v2 (offsets in bytes)
@@ -99,15 +106,17 @@ pub struct SegmentLayout {
     pub string_table_offset: usize,
     pub attr_offset: usize,
     pub attr_len: usize,
+    pub text_offset: usize,
+    pub text_len: usize,
 }
 
 impl SegmentLayout {
     pub fn parse(data: &[u8]) -> Result<Self, StorageError> {
         let header = SegmentHeader::from_bytes(data)?;
-        if &header.magic != MAGIC_V2 {
-            return Err(StorageError::Other("invalid v2 segment magic".into()));
+        if &header.magic != MAGIC_V2 && &header.magic != MAGIC_V3 {
+            return Err(StorageError::Other("invalid segment magic".into()));
         }
-        if header.version != 2 {
+        if header.version != 2 && header.version != 3 {
             return Err(StorageError::Other(format!(
                 "unsupported segment version: {}",
                 header.version
@@ -123,6 +132,8 @@ impl SegmentLayout {
             string_table_offset: header.string_table_offset as usize,
             attr_offset: header.attr_offset as usize,
             attr_len: header.attr_len as usize,
+            text_offset: header.text_offset as usize,
+            text_len: header.text_len as usize,
         })
     }
 
@@ -135,26 +146,82 @@ impl SegmentLayout {
 impl SegmentHeader {
     /// Parse header from bytes
     fn from_bytes(data: &[u8]) -> Result<Self, StorageError> {
-        if data.len() < HEADER_SIZE {
+        if data.len() < HEADER_SIZE_V2 {
             return Err(StorageError::Other("header too small".into()));
         }
-        
+
         let mut cursor = std::io::Cursor::new(data);
         let mut magic = [0u8; 4];
-        cursor.read_exact(&mut magic).map_err(|e| StorageError::Other(e.to_string()))?;
-        
+        cursor
+            .read_exact(&mut magic)
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let version = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        if (&magic == MAGIC_V2 && version != 2) || (&magic == MAGIC_V3 && version != 3) {
+            return Err(StorageError::Other(format!(
+                "unsupported segment version: {}",
+                version
+            )));
+        }
+        let vector_count = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let dimensions = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let flags = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let norm_offset = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let vector_offset = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let id_offset = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let string_table_offset = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let attr_offset = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let attr_len = cursor
+            .read_u64::<LittleEndian>()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let (text_offset, text_len) = if &magic == MAGIC_V3 {
+            if data.len() < HEADER_SIZE_V3 {
+                return Err(StorageError::Other("header too small for v3".into()));
+            }
+            let text_offset = cursor
+                .read_u64::<LittleEndian>()
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let text_len = cursor
+                .read_u64::<LittleEndian>()
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            (text_offset, text_len)
+        } else {
+            (0u64, 0u64)
+        };
+
         Ok(Self {
             magic,
-            version: cursor.read_u32::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            vector_count: cursor.read_u32::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            dimensions: cursor.read_u32::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            flags: cursor.read_u32::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            norm_offset: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            vector_offset: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            id_offset: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            string_table_offset: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            attr_offset: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
-            attr_len: cursor.read_u64::<LittleEndian>().map_err(|e| StorageError::Other(e.to_string()))?,
+            version,
+            vector_count,
+            dimensions,
+            flags,
+            norm_offset,
+            vector_offset,
+            id_offset,
+            string_table_offset,
+            attr_offset,
+            attr_len,
+            text_offset,
+            text_len,
         })
     }
 }
@@ -210,11 +277,11 @@ impl<'a> SegmentView<'a> {
     pub unsafe fn from_bytes(data: &'a [u8]) -> Result<Self, StorageError> {
         let header = SegmentHeader::from_bytes(data)?;
         
-        if &header.magic != MAGIC_V2 {
-            return Err(StorageError::Other("invalid v2 segment magic".into()));
+        if &header.magic != MAGIC_V2 && &header.magic != MAGIC_V3 {
+            return Err(StorageError::Other("invalid segment magic".into()));
         }
         
-        if header.version != 2 {
+        if header.version != 2 && header.version != 3 {
             return Err(StorageError::Other(format!(
                 "unsupported segment version: {}",
                 header.version
@@ -453,7 +520,7 @@ pub fn write_segment_v2_with_options(docs: &[Document], opts: &WriteOptions) -> 
     }
     
     // Calculate offsets
-    let norm_offset = align_to(HEADER_SIZE, ALIGNMENT);
+    let norm_offset = align_to(HEADER_SIZE_V2, ALIGNMENT);
     let norms_size = n * mem::size_of::<f32>();
     
     let vector_offset = align_to(norm_offset + norms_size, ALIGNMENT);
@@ -578,9 +645,186 @@ pub fn write_segment_v2_with_options(docs: &[Document], opts: &WriteOptions) -> 
     Ok(buf)
 }
 
+/// Write a v3 segment file (includes text table)
+pub fn write_segment_v3(docs: &[Document]) -> Result<Vec<u8>, StorageError> {
+    write_segment_v3_with_options(docs, &WriteOptions::default())
+}
+
+/// Write a v3 segment file with options
+pub fn write_segment_v3_with_options(docs: &[Document], opts: &WriteOptions) -> Result<Vec<u8>, StorageError> {
+    if docs.is_empty() {
+        return Err(StorageError::Other("no documents".into()));
+    }
+
+    let n = docs.len();
+    let d = docs[0].vector.len();
+
+    // Validate dimensions
+    for (i, doc) in docs.iter().enumerate() {
+        if doc.vector.len() != d {
+            return Err(StorageError::Other(format!(
+                "dimension mismatch at {}: {} != {}",
+                i,
+                doc.vector.len(),
+                d
+            )));
+        }
+    }
+
+    // Calculate offsets
+    let norm_offset = align_to(HEADER_SIZE_V3, ALIGNMENT);
+    let norms_size = n * mem::size_of::<f32>();
+
+    let vector_offset = align_to(norm_offset + norms_size, ALIGNMENT);
+    let vectors_size = n * d * mem::size_of::<f32>();
+
+    let id_offset = align_to(vector_offset + vectors_size, 8);
+    let ids_size = n * mem::size_of::<u64>();
+
+    let string_table_offset = id_offset + ids_size;
+
+    // Build string table
+    let mut string_table = Vec::new();
+    for doc in docs {
+        let id_bytes = doc.id.as_bytes();
+        string_table
+            .write_u32::<LittleEndian>(id_bytes.len() as u32)
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        string_table.extend_from_slice(id_bytes);
+    }
+
+    // Align attr_offset to 4 bytes for rkyv
+    let attr_offset = align_to(string_table_offset + string_table.len(), 4);
+
+    // Build attributes
+    let attrs: Vec<SegmentAttrV2> = docs
+        .iter()
+        .map(|doc| {
+            let json = match &doc.attributes {
+                Some(attrs) => serde_json::to_vec(attrs).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            SegmentAttrV2 { attributes_json: json }
+        })
+        .collect();
+
+    let attr_bytes = rkyv::to_bytes::<_, 256>(&attrs)
+        .map_err(|e| StorageError::Other(e.to_string()))?;
+    let attr_len = attr_bytes.len();
+
+    // Build text table (length-prefixed per doc)
+    let mut text_table = Vec::new();
+    for doc in docs {
+        let text = doc.text.as_deref().unwrap_or("");
+        let bytes = text.as_bytes();
+        text_table
+            .write_u32::<LittleEndian>(bytes.len() as u32)
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        text_table.extend_from_slice(bytes);
+    }
+
+    let text_offset = align_to(attr_offset + attr_len, 4);
+    let text_len = text_table.len();
+
+    // Allocate buffer
+    let total_size = text_offset + text_len;
+    let mut buf = vec![0u8; total_size];
+
+    // Set flags
+    let segment_flags = if opts.normalize_vectors {
+        flags::VECTORS_NORMALIZED
+    } else {
+        0
+    };
+
+    // Write header
+    buf[0..4].copy_from_slice(MAGIC_V3);
+    (&mut buf[4..8]).write_u32::<LittleEndian>(3).unwrap();
+    (&mut buf[8..12]).write_u32::<LittleEndian>(n as u32).unwrap();
+    (&mut buf[12..16]).write_u32::<LittleEndian>(d as u32).unwrap();
+    (&mut buf[16..20]).write_u32::<LittleEndian>(segment_flags).unwrap();
+    (&mut buf[20..28]).write_u64::<LittleEndian>(norm_offset as u64).unwrap();
+    (&mut buf[28..36]).write_u64::<LittleEndian>(vector_offset as u64).unwrap();
+    (&mut buf[36..44]).write_u64::<LittleEndian>(id_offset as u64).unwrap();
+    (&mut buf[44..52]).write_u64::<LittleEndian>(string_table_offset as u64).unwrap();
+    (&mut buf[52..60]).write_u64::<LittleEndian>(attr_offset as u64).unwrap();
+    (&mut buf[60..68]).write_u64::<LittleEndian>(attr_len as u64).unwrap();
+    (&mut buf[68..76]).write_u64::<LittleEndian>(text_offset as u64).unwrap();
+    (&mut buf[76..84]).write_u64::<LittleEndian>(text_len as u64).unwrap();
+
+    // Write norms and optionally normalized vectors
+    let mut offset = norm_offset;
+
+    if opts.normalize_vectors {
+        // Compute norms first, then write normalized vectors
+        let mut normalized_vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for doc in docs {
+            let norm = simd::l2_norm_f32(&doc.vector);
+            (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(1.0).unwrap();
+            offset += 4;
+
+            if norm == 0.0 {
+                normalized_vecs.push(doc.vector.clone());
+            } else {
+                normalized_vecs.push(simd::normalized_f32(&doc.vector));
+            }
+        }
+
+        // Write normalized vectors
+        offset = vector_offset;
+        for vec in &normalized_vecs {
+            for &v in vec {
+                (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(v).unwrap();
+                offset += 4;
+            }
+        }
+    } else {
+        // Write original norms
+        for doc in docs {
+            let norm = simd::l2_norm_f32(&doc.vector);
+            (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(norm).unwrap();
+            offset += 4;
+        }
+
+        // Write original vectors
+        offset = vector_offset;
+        for doc in docs {
+            for &v in &doc.vector {
+                (&mut buf[offset..offset + 4]).write_f32::<LittleEndian>(v).unwrap();
+                offset += 4;
+            }
+        }
+    }
+
+    // Write IDs
+    offset = id_offset;
+    for doc in docs {
+        let id_hash = hash_id(&doc.id);
+        (&mut buf[offset..offset + 8]).write_u64::<LittleEndian>(id_hash).unwrap();
+        offset += 8;
+    }
+
+    // Write string table
+    buf[string_table_offset..string_table_offset + string_table.len()]
+        .copy_from_slice(&string_table);
+
+    // Write attributes
+    buf[attr_offset..attr_offset + attr_len].copy_from_slice(&attr_bytes);
+
+    // Write text table
+    buf[text_offset..text_offset + text_len].copy_from_slice(&text_table);
+
+    Ok(buf)
+}
+
 /// Check if data is v2 format
 pub fn is_v2_format(data: &[u8]) -> bool {
     data.len() >= 4 && &data[0..4] == MAGIC_V2
+}
+
+/// Check if data is v3 format
+pub fn is_v3_format(data: &[u8]) -> bool {
+    data.len() >= 4 && &data[0..4] == MAGIC_V3
 }
 
 #[cfg(test)]
@@ -593,11 +837,13 @@ mod tests {
             Document {
                 id: "doc1".to_string(),
                 vector: vec![1.0, 0.0, 0.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "doc2".to_string(),
                 vector: vec![0.0, 1.0, 0.0],
+                text: None,
                 attributes: None,
             },
         ];
@@ -626,11 +872,13 @@ mod tests {
             Document {
                 id: "doc1".to_string(),
                 vector: vec![3.0, 4.0, 0.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "doc2".to_string(),
                 vector: vec![0.0, 5.0, 12.0],
+                text: None,
                 attributes: None,
             },
         ];
@@ -661,16 +909,19 @@ mod tests {
             Document {
                 id: "a".to_string(),
                 vector: vec![1.0, 0.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "b".to_string(),
                 vector: vec![0.0, 1.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "c".to_string(),
                 vector: vec![0.7, 0.7],
+                text: None,
                 attributes: None,
             },
         ];
@@ -692,16 +943,19 @@ mod tests {
             Document {
                 id: "a".to_string(),
                 vector: vec![1.0, 0.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "b".to_string(),
                 vector: vec![0.0, 1.0],
+                text: None,
                 attributes: None,
             },
             Document {
                 id: "c".to_string(),
                 vector: vec![0.7, 0.7],
+                text: None,
                 attributes: None,
             },
         ];

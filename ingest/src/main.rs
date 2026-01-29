@@ -55,7 +55,9 @@ async fn main() {
         hnsw_ef_construction: cfg.hnsw_ef_construction,
         hnsw_ef_search: cfg.hnsw_ef_search,
         metric: tidepool_common::vector::DistanceMetric::Cosine,
-        use_v2_format: true,
+        use_v3_format: true,
+        text_index_enabled: cfg.text_index_enabled,
+        tokenizer_config: cfg.tokenizer_config(),
         ivf_enabled: cfg.ivf_enabled,
         ivf_min_segment_size: cfg.ivf_min_segment_size,
         ivf_k_factor: cfg.ivf_k_factor,
@@ -201,7 +203,21 @@ async fn upsert(
     };
 
     if req.vectors.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "vectors are required");
+        return json_error(StatusCode::BAD_REQUEST, "vectors array is required and cannot be empty");
+    }
+
+    // Validate each document has a non-empty vector (required for indexing)
+    // Text field is optional and used for hybrid search when present
+    for (i, doc) in req.vectors.iter().enumerate() {
+        if doc.vector.is_empty() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "document at index {} is missing required 'vector' field (text-only documents are not yet supported)",
+                    i
+                ),
+            );
+        }
     }
 
     // Write to WAL for durability (query nodes will scan WAL for real-time visibility)

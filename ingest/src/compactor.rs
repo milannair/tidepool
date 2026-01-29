@@ -63,23 +63,34 @@ impl<S: Store + Clone> Compactor<S> {
             existing_segments = manifest.segments;
         }
 
+        // Filter to documents with vectors (required for segment storage)
+        // Note: text-only documents are rejected at ingest time, but we filter here
+        // as a safety measure to avoid silent failures if any slip through
+        let total_docs = doc_map.len();
         let mut docs: Vec<Document> = doc_map
             .into_values()
             .filter(|doc| !doc.vector.is_empty())
             .collect();
+        
+        let skipped = total_docs - docs.len();
+        if skipped > 0 {
+            warn!(
+                "Skipped {} documents without vectors during compaction (text-only documents not yet supported)",
+                skipped
+            );
+        }
 
         docs.sort_by(|a, b| a.id.cmp(&b.id));
 
+        // Validate vector dimensions
         let mut dims = existing_dimensions;
         for (i, doc) in docs.iter().enumerate() {
-            if doc.vector.is_empty() {
-                return Err(format!("document {} has empty vector during compaction", i));
-            }
             if dims == 0 {
                 dims = doc.vector.len();
             } else if doc.vector.len() != dims {
                 return Err(format!(
-                    "dimension mismatch during compaction: got {} want {}",
+                    "dimension mismatch during compaction at doc {}: got {} want {}",
+                    i,
                     doc.vector.len(),
                     dims
                 ));

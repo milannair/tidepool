@@ -310,6 +310,7 @@ async fn run_ingest(args: &Args, client: &Client) -> Result<IngestSummary> {
                     vectors.push(Document {
                         id: format!("{}{}", args.id_prefix, i),
                         vector,
+                        text: None,
                         attributes,
                     });
                 }
@@ -421,6 +422,11 @@ async fn run_query(args: &Args, client: &Client) -> Result<QuerySummary> {
                 let filters = filter_mode.make_filter(&mut rng);
                 let req = QueryRequest {
                     vector,
+                    text: None,
+                    mode: None,
+                    alpha: None,
+                    fusion: None,
+                    rrf_k: None,
                     top_k: args.top_k,
                     ef_search: args.ef_search,
                     nprobe: 0,

@@ -16,6 +16,14 @@ pub enum StorageError {
     Other(String),
 }
 
+/// Object metadata from HEAD request (for cache invalidation).
+#[derive(Debug, Clone)]
+pub struct ObjectMeta {
+    pub etag: Option<String>,
+    pub last_modified: Option<i64>,
+    pub size: u64,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError>;
@@ -23,6 +31,8 @@ pub trait Store: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
     async fn exists(&self, key: &str) -> Result<bool, StorageError>;
+    /// Return object metadata without downloading body. NotFound if key does not exist.
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError>;
 }
 
 #[derive(Clone)]
@@ -74,6 +84,26 @@ impl Store for InMemoryStore {
         let map = self.data.read().await;
         Ok(map.contains_key(key))
     }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+        let map = self.data.read().await;
+        match map.get(key) {
+            Some(data) => Ok(ObjectMeta {
+                etag: Some(format!("{:x}", simple_hash(data))),
+                last_modified: None,
+                size: data.len() as u64,
+            }),
+            None => Err(StorageError::NotFound(key.to_string())),
+        }
+    }
+}
+
+fn simple_hash(data: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(data);
+    hasher.finish()
 }
 
 #[derive(Clone)]
@@ -181,25 +211,41 @@ impl Store for S3Store {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, StorageError> {
+        match self.head(key).await {
+            Ok(_) => Ok(true),
+            Err(StorageError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
         let resp = self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await;
-
-        match resp {
-            Ok(_) => Ok(true),
-            Err(err) => {
+            .await
+            .map_err(|err| {
                 let msg = err.to_string();
                 if msg.contains("NotFound") || msg.contains("NoSuchKey") {
-                    Ok(false)
+                    StorageError::NotFound(key.to_string())
                 } else {
-                    Err(StorageError::Other(format!("head object {}: {}", key, err)))
+                    StorageError::Other(format!("head object {}: {}", key, err))
                 }
-            }
-        }
+            })?;
+
+        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_string());
+        let last_modified = resp
+            .last_modified()
+            .and_then(|dt| dt.secs().try_into().ok());
+        let size = resp.content_length().unwrap_or(0) as u64;
+
+        Ok(ObjectMeta {
+            etag,
+            last_modified,
+            size,
+        })
     }
 }
 
@@ -237,6 +283,10 @@ pub fn segment_ivf_path(namespace: &str, segment_id: &str) -> String {
 
 pub fn segment_quant_path(namespace: &str, segment_id: &str) -> String {
     namespace_path(namespace, &format!("segments/{}.tpq", segment_id))
+}
+
+pub fn segment_text_index_path(namespace: &str, segment_id: &str) -> String {
+    namespace_path(namespace, &format!("segments/{}.tpti", segment_id))
 }
 
 pub fn tombstone_path(namespace: &str) -> String {

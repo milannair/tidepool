@@ -1,8 +1,19 @@
+use std::path::PathBuf;
+
 use chrono::Utc;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::fs;
 
 use crate::storage::{latest_manifest_path, manifest_path, Store, StorageError};
+
+fn manifest_cache_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let hash = hasher.finalize();
+    format!("{:x}", hash)[..16].to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -28,6 +39,7 @@ pub struct Segment {
 pub struct Manager<S: Store> {
     storage: S,
     namespace: String,
+    cache_dir: Option<PathBuf>,
 }
 
 impl<S: Store> Manager<S> {
@@ -35,17 +47,73 @@ impl<S: Store> Manager<S> {
         Self {
             storage,
             namespace: namespace.into(),
+            cache_dir: None,
+        }
+    }
+
+    pub fn new_with_cache(
+        storage: S,
+        namespace: impl Into<String>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            storage,
+            namespace: namespace.into(),
+            cache_dir,
         }
     }
 
     pub async fn load(&self) -> Result<Manifest, StorageError> {
         let data = self.storage.get(&latest_manifest_path(&self.namespace)).await?;
-        // SAFETY: We trust our own serialized data format
-        let archived = unsafe { rkyv::archived_root::<Manifest>(&data) };
-        let manifest: Manifest = archived
-            .deserialize(&mut rkyv::Infallible)
-            .map_err(|err| StorageError::Other(format!("parse manifest: {}", err)))?;
-        Ok(manifest)
+        parse_manifest_bytes(&data)
+    }
+
+    /// Load manifest only if it has changed (HEAD + cache). Returns None if unchanged.
+    pub async fn load_if_changed(&self) -> Result<Option<Manifest>, StorageError> {
+        let key = latest_manifest_path(&self.namespace);
+
+        let meta = match self.storage.head(&key).await {
+            Ok(m) => m,
+            Err(StorageError::NotFound(_)) => {
+                // No manifest yet; if we have cache, leave it; otherwise caller will retry
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let Some(ref cache_dir) = self.cache_dir else {
+            let data = self.storage.get(&key).await?;
+            return Ok(Some(parse_manifest_bytes(&data)?));
+        };
+
+        let cache_key = manifest_cache_key(&key);
+        let cache_rkyv = cache_dir.join("manifest").join(format!("{}.rkyv", cache_key));
+        let cache_etag = cache_dir.join("manifest").join(format!("{}.etag", cache_key));
+
+        if let (Some(ref etag), true) = (&meta.etag, cache_etag.is_file()) {
+            if let Ok(cached_etag) = fs::read_to_string(&cache_etag).await {
+                let cached_etag = cached_etag.trim();
+                if cached_etag == etag {
+                    if let Ok(data) = fs::read(&cache_rkyv).await {
+                        if parse_manifest_bytes(&data).is_ok() {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        let data = self.storage.get(&key).await?;
+        let manifest = parse_manifest_bytes(&data)?;
+
+        let manifest_dir = cache_dir.join("manifest");
+        let _ = std::fs::create_dir_all(&manifest_dir);
+        let _ = fs::write(&cache_rkyv, &data).await;
+        if let Some(ref etag) = meta.etag {
+            let _ = fs::write(&cache_etag, etag).await;
+        }
+
+        Ok(Some(manifest))
     }
 
     pub async fn load_version(&self, version: &str) -> Result<Manifest, StorageError> {
@@ -72,6 +140,14 @@ impl<S: Store> Manager<S> {
         self.storage.put(&latest_path, data).await?;
         Ok(())
     }
+}
+
+fn parse_manifest_bytes(data: &[u8]) -> Result<Manifest, StorageError> {
+    let archived = unsafe { rkyv::archived_root::<Manifest>(data) };
+    let manifest: Manifest = archived
+        .deserialize(&mut rkyv::Infallible)
+        .map_err(|err| StorageError::Other(format!("parse manifest: {}", err)))?;
+    Ok(manifest)
 }
 
 impl Manifest {

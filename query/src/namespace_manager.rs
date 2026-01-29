@@ -104,7 +104,12 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
             }
 
             let hot_buffer = if self.hot_buffer_max_size > 0 {
-                Some(Arc::new(HotBuffer::new(self.hot_buffer_max_size)))
+                Some(Arc::new(HotBuffer::new(
+                    self.hot_buffer_max_size,
+                    self.options.tokenizer_config.clone(),
+                    self.options.bm25_k1,
+                    self.options.bm25_b,
+                )))
             } else {
                 None
             };

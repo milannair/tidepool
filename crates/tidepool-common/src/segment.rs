@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use hex::encode as hex_encode;
 use memmap2::Mmap;
 use ordered_float::OrderedFloat;
@@ -19,16 +19,19 @@ use crate::attributes::AttrValue;
 use crate::document::Document;
 use crate::index::hnsw::{HnswIndex, ResultItem, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M};
 use crate::index::ivf::IVFIndex;
+use crate::index::text::TextIndex;
 use crate::quantization::{self, QuantizationKind, QuantizedVectors, Sq8Query};
-use crate::segment_v2::{self, compute_norm, write_segment_v2, is_v2_format, SegmentLayout, SegmentView};
+use crate::segment_v2::{self, compute_norm, write_segment_v2, write_segment_v3, is_v2_format, is_v3_format, SegmentLayout, SegmentView};
 use crate::storage::{
     segment_index_path,
     segment_ivf_path,
     segment_path,
     segment_quant_path,
+    segment_text_index_path,
     Store,
     StorageError,
 };
+use crate::text::DefaultTokenizer;
 use crate::vector::{distance_with_norms, DistanceMetric};
 
 /// Segment data - supports both owned (v1) and zero-copy (v2) modes
@@ -40,6 +43,8 @@ pub struct SegmentData {
     pub vectors: Vec<Vec<f32>>,
     /// Attributes
     pub attributes: Vec<Option<AttrValue>>,
+    /// Stored text (v3 segments)
+    pub texts: Vec<Option<String>>,
     /// Vector dimensions
     pub dimensions: usize,
     /// HNSW index for ANN search
@@ -50,6 +55,8 @@ pub struct SegmentData {
     pub quantization: Option<QuantizedVectors>,
     /// Filter index for attribute queries
     pub filters: Option<FilterIndex>,
+    /// Text index for BM25 search
+    pub text_index: Option<TextIndex>,
     /// Raw segment data for zero-copy v2 access (kept for lifetime)
     #[allow(dead_code)]
     raw_data: Option<Arc<SegmentBytes>>,
@@ -76,6 +83,7 @@ impl std::fmt::Debug for SegmentData {
             .field("has_index", &self.index.is_some())
             .field("has_ivf", &self.ivf_index.is_some())
             .field("has_quant", &self.quantization.is_some())
+            .field("has_text_index", &self.text_index.is_some())
             .field("is_v2", &self.is_v2)
             .finish()
     }
@@ -96,8 +104,12 @@ pub struct WriterOptions {
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
     pub metric: DistanceMetric,
-    /// Use v2 zero-copy format (default: true)
-    pub use_v2_format: bool,
+    /// Use v3 segment format (default: true)
+    pub use_v3_format: bool,
+    /// Enable text index build
+    pub text_index_enabled: bool,
+    /// Tokenizer config for text index
+    pub tokenizer_config: crate::text::TokenizerConfig,
     /// Enable IVF index build
     pub ivf_enabled: bool,
     /// Minimum vectors required to build IVF (otherwise HNSW)
@@ -125,7 +137,9 @@ impl Default for WriterOptions {
             hnsw_ef_construction: DEFAULT_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_EF_SEARCH,
             metric: DistanceMetric::Cosine,
-            use_v2_format: true,
+            use_v3_format: true,
+            text_index_enabled: true,
+            tokenizer_config: crate::text::TokenizerConfig::default(),
             ivf_enabled: true,
             ivf_min_segment_size: 10_000,
             ivf_k_factor: 1.0,
@@ -190,11 +204,11 @@ impl<S: Store> Writer<S> {
 
         let segment_id = uuid::Uuid::new_v4().to_string();
         
-        // Write segment data (v2 or v1 format)
-        let buf = if self.opts.use_v2_format {
-            write_segment_v2(docs)?
+        // Write segment data (v3 or v2 format)
+        let buf = if self.opts.use_v3_format {
+            write_segment_v3(docs)?
         } else {
-            self.write_segment_v1(docs, dimensions)?
+            write_segment_v2(docs)?
         };
 
         let segment_key = segment_path(&self.namespace, &segment_id);
@@ -202,7 +216,7 @@ impl<S: Store> Writer<S> {
 
         let use_ivf = self.opts.ivf_enabled && docs.len() >= self.opts.ivf_min_segment_size;
         let mut quant_key: Option<String> = None;
-        if self.opts.use_v2_format
+        if self.opts.use_v3_format
             && use_ivf
             && self.opts.quantization != QuantizationKind::None
         {
@@ -272,51 +286,30 @@ impl<S: Store> Writer<S> {
             }
         }
 
+        // Build text index (optional)
+        if self.opts.text_index_enabled {
+            let tokenizer = DefaultTokenizer::new(self.opts.tokenizer_config.clone());
+            if let Some(text_index) = TextIndex::build(docs, &tokenizer) {
+                let text_data = text_index
+                    .marshal_binary()
+                    .map_err(|e| StorageError::Other(format!("serialize text index: {}", e)))?;
+                let text_key = segment_text_index_path(&self.namespace, &segment_id);
+                if let Err(err) = self.storage.put(&text_key, text_data).await {
+                    let _ = self.storage.delete(&segment_key).await;
+                    let _ = self.storage.delete(&segment_index_path(&self.namespace, &segment_id)).await;
+                    let _ = self.storage.delete(&segment_ivf_path(&self.namespace, &segment_id)).await;
+                    let _ = self.storage.delete(&segment_quant_path(&self.namespace, &segment_id)).await;
+                    return Err(err);
+                }
+            }
+        }
+
         Ok(Some(ManifestSegment {
             id: segment_id,
             segment_key,
             doc_count: docs.len() as i64,
             dimensions,
         }))
-    }
-    
-    /// Write v1 format segment (legacy)
-    fn write_segment_v1(&self, docs: &[Document], dimensions: usize) -> Result<Vec<u8>, StorageError> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"TPVS");
-        buf.write_u32::<LittleEndian>(1)
-            .map_err(|e| StorageError::Other(format!("write version: {}", e)))?;
-        buf.write_u32::<LittleEndian>(docs.len() as u32)
-            .map_err(|e| StorageError::Other(format!("write vector count: {}", e)))?;
-        buf.write_u32::<LittleEndian>(dimensions as u32)
-            .map_err(|e| StorageError::Other(format!("write dimensions: {}", e)))?;
-
-        let mut attr_data = Vec::with_capacity(docs.len());
-
-        for doc in docs {
-            for v in &doc.vector {
-                buf.write_f32::<LittleEndian>(*v)
-                    .map_err(|e| StorageError::Other(format!("write vector: {}", e)))?;
-            }
-            let attributes_json = match &doc.attributes {
-                Some(attrs) => serde_json::to_vec(attrs)
-                    .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?,
-                None => Vec::new(),
-            };
-            attr_data.push(SegmentAttr {
-                id: doc.id.clone(),
-                attributes_json,
-            });
-        }
-
-        let attr_bytes = rkyv::to_bytes::<_, 256>(&attr_data)
-            .map_err(|e| StorageError::Other(format!("serialize attributes: {}", e)))?;
-        let attr_bytes = attr_bytes.as_ref();
-        buf.write_u32::<LittleEndian>(attr_bytes.len() as u32)
-            .map_err(|e| StorageError::Other(format!("write attr length: {}", e)))?;
-        buf.extend_from_slice(attr_bytes);
-        
-        Ok(buf)
     }
 }
 
@@ -372,7 +365,7 @@ impl<S: Store> Reader<S> {
         let bytes = data.as_slice();
         
         // Check format version
-        if is_v2_format(bytes) {
+        if is_v2_format(bytes) || is_v3_format(bytes) {
             self.read_segment_v2(segment_key, data).await
         } else {
             self.read_segment_v1(segment_key, data).await
@@ -385,6 +378,7 @@ impl<S: Store> Reader<S> {
         let bytes = data.as_slice();
         
         let layout = SegmentLayout::parse(bytes)?;
+        let is_v2 = is_v2_format(bytes);
         // SAFETY: We verify the format and bounds in SegmentView::from_bytes
         let view = unsafe { SegmentView::from_bytes(bytes)? };
         
@@ -424,6 +418,13 @@ impl<S: Store> Reader<S> {
                 .collect()
         } else {
             vec![None; num_vectors]
+        };
+
+        // Extract text table (v3 only)
+        let texts = if layout.text_len > 0 {
+            parse_text_table(bytes, layout.text_offset, layout.text_len, num_vectors)?
+        } else {
+            Vec::new()
         };
         
         // Load IVF index + quantization sidecar (if present)
@@ -467,18 +468,32 @@ impl<S: Store> Reader<S> {
             ids,
             vectors,
             attributes: attrs,
+            texts,
             dimensions,
             index: None,
             ivf_index,
             quantization,
             filters: None,
+            text_index: None,
             raw_data: Some(data),
             raw_layout: Some(layout),
             norms,
-            is_v2: true,
+            is_v2,
             vector_count: num_vectors,
             quantization_rerank_factor: self.quantization_rerank_factor,
         };
+
+        // Load text index sidecar (if present)
+        if let Some(segment_id) = segment_id_from_key(segment_key) {
+            let text_key = segment_text_index_path(&self.namespace, &segment_id);
+            if self.storage.exists(&text_key).await.unwrap_or(false) {
+                if let Ok(text_data) = self.get_text_index_data(&text_key).await {
+                    if let Ok(idx) = TextIndex::load_binary(text_data.as_slice()) {
+                        seg.text_index = Some(idx);
+                    }
+                }
+            }
+        }
 
         // Load HNSW index only when IVF is not present
         if seg.ivf_index.is_none() {
@@ -580,11 +595,13 @@ impl<S: Store> Reader<S> {
             ids,
             vectors,
             attributes: attrs,
+            texts: Vec::new(),
             dimensions,
             index: None,
             ivf_index: None,
             quantization: None,
             filters: None,
+            text_index: None,
             raw_data: None,
             raw_layout: None,
             norms,
@@ -690,6 +707,24 @@ impl<S: Store> Reader<S> {
         Ok(SegmentBytes::Owned(data))
     }
 
+    async fn get_text_index_data(&self, text_key: &str) -> Result<SegmentBytes, StorageError> {
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(text_key, "tpti"));
+            if let Some(mmap) = map_cached_file(cache_path.clone()).await {
+                return Ok(SegmentBytes::Mapped(mmap));
+            }
+            if let Ok(data) = fs::read(&cache_path).await {
+                return Ok(SegmentBytes::Owned(data));
+            }
+        }
+        let data = self.storage.get(text_key).await?;
+        if let Some(dir) = &self.cache_dir {
+            let cache_path = format!("{}/{}", dir, cache_key(text_key, "tpti"));
+            let _ = fs::write(cache_path, &data).await;
+        }
+        Ok(SegmentBytes::Owned(data))
+    }
+
     /// Remove cached files for segments not in the valid set.
     /// Call this after loading a new manifest to clean up stale cache entries.
     /// Returns the number of files removed.
@@ -720,6 +755,7 @@ impl<S: Store> Reader<S> {
                 && !filename.ends_with(".hnsw")
                 && !filename.ends_with(".ivf")
                 && !filename.ends_with(".tpq")
+                && !filename.ends_with(".tpti")
             {
                 continue;
             }
@@ -751,6 +787,45 @@ fn cache_key_prefix(key: &str) -> String {
     hex[..16].to_string()
 }
 
+fn parse_text_table(
+    bytes: &[u8],
+    offset: usize,
+    len: usize,
+    count: usize,
+) -> Result<Vec<Option<String>>, StorageError> {
+    if len == 0 || count == 0 {
+        return Ok(Vec::new());
+    }
+    if offset + len > bytes.len() {
+        return Err(StorageError::Other("text table out of bounds".into()));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    let mut cursor = std::io::Cursor::new(&bytes[offset..offset + len]);
+    for _ in 0..count {
+        if (cursor.position() as usize) >= len {
+            out.push(None);
+            continue;
+        }
+        let str_len = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| StorageError::Other(format!("read text length: {}", e)))? as usize;
+        if str_len == 0 {
+            out.push(None);
+            continue;
+        }
+        let mut buf = vec![0u8; str_len];
+        cursor
+            .read_exact(&mut buf)
+            .map_err(|e| StorageError::Other(format!("read text: {}", e)))?;
+        let text = String::from_utf8(buf)
+            .map_err(|e| StorageError::Other(format!("decode text: {}", e)))?;
+        out.push(Some(text));
+    }
+
+    Ok(out)
+}
+
 /// Segment data storage - either owned or memory-mapped
 pub enum SegmentBytes {
     Owned(Vec<u8>),
@@ -780,6 +855,12 @@ impl SegmentBytes {
 pub struct ScoredResult {
     pub index: usize,
     pub dist: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextScoredResult {
+    pub index: usize,
+    pub score: f32,
 }
 
 impl SegmentData {
@@ -890,6 +971,45 @@ impl SegmentData {
         // Filter couldn't be evaluated by index, return empty
         // (In production, this would fall back to post-filtering)
         Vec::new()
+    }
+
+    pub fn text_search(
+        &self,
+        tokens: &[String],
+        top_k: usize,
+        filters: Option<&AttrValue>,
+        bm25_k1: f32,
+        bm25_b: f32,
+    ) -> Vec<TextScoredResult> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let Some(index) = &self.text_index else {
+            return Vec::new();
+        };
+
+        let mut allowed = None;
+        if let Some(filter_value) = filters {
+            if let Some(filter_index) = &self.filters {
+                allowed = filter_index.evaluate(filter_value);
+                if let Some(bitmap) = &allowed {
+                    if bitmap.is_empty() {
+                        return Vec::new();
+                    }
+                }
+            } else {
+                return Vec::new();
+            }
+        }
+
+        let results = index.search(tokens, top_k, allowed.as_ref(), bm25_k1, bm25_b);
+        results
+            .into_iter()
+            .map(|(doc_id, score)| TextScoredResult {
+                index: doc_id as usize,
+                score,
+            })
+            .collect()
     }
 
     fn ivf_search(
@@ -1282,11 +1402,13 @@ mod tests {
             ids,
             vectors: vectors.clone(),
             attributes: vec![None; count],
+            texts: Vec::new(),
             dimensions: dims,
             index: None,
             ivf_index: Some(ivf),
             quantization: None,
             filters: None,
+            text_index: None,
             raw_data: None,
             raw_layout: None,
             norms,

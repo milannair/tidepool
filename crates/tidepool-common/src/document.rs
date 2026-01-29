@@ -12,6 +12,8 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector: Vector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<AttrValue>,
 }
 
@@ -21,6 +23,7 @@ pub struct Document {
 pub struct RkyvDocument {
     pub id: String,
     pub vector: Vector,
+    pub text: Option<String>,
     pub attributes_json: Vec<u8>,
 }
 
@@ -33,6 +36,7 @@ impl From<&Document> for RkyvDocument {
         Self {
             id: doc.id.clone(),
             vector: doc.vector.clone(),
+            text: doc.text.clone(),
             attributes_json,
         }
     }
@@ -48,6 +52,7 @@ impl From<RkyvDocument> for Document {
         Self {
             id: doc.id,
             vector: doc.vector,
+            text: doc.text,
             attributes,
         }
     }
@@ -60,12 +65,23 @@ pub struct VectorResult {
     pub vector: Vector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<AttrValue>,
-    pub dist: f32,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
+    #[serde(default)]
     pub vector: Vector,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    pub fusion: Option<String>,
+    #[serde(default)]
+    pub rrf_k: Option<u32>,
     #[serde(default)]
     pub top_k: usize,
     #[serde(default)]
