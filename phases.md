@@ -123,13 +123,6 @@ segment_v2.tpvs (TPV2 magic):
 - `segment_v2.rs`: Added `WriteOptions::normalize_vectors` for pre-normalization
 - Uses `std::arch::x86_64` intrinsics (no external crate dependencies)
 
-### Benchmark Results (scalar fallback, no AVX2)
-```
-distance_throughput/euclidean/10000:    320µs (0.32ms) — 31.2 Melem/s
-distance_throughput/dot_product/10000:  531µs (0.53ms) — 18.8 Melem/s
-distance_throughput/cosine_prenorm/10000: 543µs (0.54ms) — 18.4 Melem/s
-```
-
 **Exit Criteria:**
 - [x] Distance kernel throughput >1B ops/sec on 128-dim vectors (achieved: 2.3-3.1B elem/s)
 - [x] 10k distance computations in <5ms (achieved: 0.32-0.54ms)
@@ -154,13 +147,6 @@ distance_throughput/cosine_prenorm/10000: 543µs (0.54ms) — 18.4 Melem/s
 - [x] `ivf_search()` with nprobe parameter (`segment.rs`)
 - [x] Serialization format (`.ivf` files with TPIV magic)
 - [x] Hybrid: IVF for large segments (>10k vectors), HNSW for small
-
-### Implementation Details
-- `index/ivf.rs`: IVF index with k-means clustering, centroid routing, posting lists
-- Automatic k selection: `k = sqrt(n) * k_factor`, clamped to [min_k, max_k]
-- Triangle inequality pruning for early cluster elimination
-- Configurable nprobe at query time (default: 10)
-- IVF built during compaction for segments exceeding `IVF_MIN_SEGMENT_SIZE`
 
 ### File Format
 ```
@@ -216,11 +202,98 @@ segment.ivf (TPIV magic):
 
 ---
 
-## Phase 7: Deterministic Vector Ordering
+## Phase 7: Real-Time Updates
+
+**Objective:** Enable sub-second write-to-query latency using Redis pub/sub and in-memory buffers.
+
+**Why Seventh:** Current eventual consistency (~5 minute compaction interval) is insufficient for real-time applications. Users expect vectors to be queryable immediately after upsert.
+
+### Architecture
+
+```
+                         ┌─────────────────┐
+        POST /upsert ───▶│     Ingest      │
+                         │  1. Write WAL   │
+                         │  2. Publish msg │
+                         └────────┬────────┘
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │   Redis Pub/Sub │
+                         └────────┬────────┘
+                                  │
+              ┌───────────────────┼───────────────────┐
+              ▼                   ▼                   ▼
+       ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+       │  Query #1   │     │  Query #2   │     │  Query #3   │
+       │  + buffer   │     │  + buffer   │     │  + buffer   │
+       └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+### Techniques
+- **Redis Pub/Sub:** Broadcast new vectors from ingest to all query instances
+- **In-memory hot buffer:** Query service maintains recent vectors in memory
+- **Brute-force buffer search:** Small buffer (~10k vectors) searched linearly
+- **Result merging:** Combine buffer results with segment results, dedupe by ID
+- **Buffer cleanup:** Clear vectors from buffer after they appear in compacted segments
+
+### Deliverables
+- [ ] Add Redis dependency (`redis` crate with tokio support)
+- [ ] `HotBuffer` struct in query service with thread-safe vector storage
+- [ ] Redis publisher in ingest service (publish after WAL write)
+- [ ] Redis subscriber task in query service (background vector ingestion)
+- [ ] `buffer_search()` with brute-force distance computation
+- [ ] `merge_results()` combining hot buffer and cold segment results
+- [ ] Buffer size limits and overflow handling
+- [ ] Tombstone handling in buffer (mark deleted IDs)
+- [ ] Config: `REDIS_URL`, `HOT_BUFFER_MAX_SIZE`
+
+### Query Flow (Updated)
+```
+1. refresh_state()           // Load manifest, segments (existing)
+2. buffer_search(query)      // Search hot buffer (new)
+3. segment_search(query)     // Search cold segments (existing)
+4. merge_results(buffer, segments, top_k)  // Combine and dedupe (new)
+5. apply_tombstones()        // Filter deleted IDs (existing)
+6. return top_k results
+```
+
+### Buffer Implementation
+```rust
+pub struct HotBuffer {
+    vectors: RwLock<Vec<Document>>,
+    deleted: RwLock<HashSet<String>>,
+    max_size: usize,
+    last_compaction_version: AtomicU64,
+}
+
+impl HotBuffer {
+    pub async fn insert(&self, docs: Vec<Document>);
+    pub async fn delete(&self, ids: Vec<String>);
+    pub async fn search(&self, query: &[f32], top_k: usize, metric: DistanceMetric) -> Vec<VectorResult>;
+    pub async fn clear_compacted(&self, version: u64);
+}
+```
+
+### Horizontal Scaling
+- Each query replica subscribes to Redis
+- Each replica maintains its own buffer (no shared state)
+- All replicas receive same vectors via pub/sub
+- Consistent results across replicas
+
+**Exit Criteria:**
+- Write-to-query latency <1 second
+- Buffer search adds <5ms to query latency
+- Horizontal scaling works (3 replicas, consistent results)
+- No data loss (WAL provides durability, buffer provides speed)
+
+---
+
+## Phase 8: Deterministic Vector Ordering
 
 **Objective:** Maximize early-exit effectiveness by reordering vectors within posting lists so that high-quality candidates appear first, causing top-k bounds to tighten rapidly and most distance computations to abort early.
 
-**Why Seventh:** After IVF partitions vectors and quantization reduces precision, the *order* in which vectors are scanned within each cluster determines how quickly bounds tighten. Random ordering wastes SIMD cycles on vectors that will never make top-k. This is a layout + math synergy that most vector databases do not exploit.
+**Why Eighth:** After IVF partitions vectors and quantization reduces precision, the *order* in which vectors are scanned within each cluster determines how quickly bounds tighten. Random ordering wastes SIMD cycles on vectors that will never make top-k.
 
 ### Why This Is Not Commonly Implemented
 - Requires control over segment layout (cloud-hosted DBs often don't have this)
@@ -229,25 +302,11 @@ segment.ivf (TPIV magic):
 - Academic ANN papers focus on recall, not average-case latency
 - Retrofitting into mutable indexes is complex; immutable segments make this trivial
 
-### Core Insight
-When scanning a posting list for top-k, the k-th best distance acts as a threshold. Any vector whose partial dot product cannot exceed this threshold can be skipped mid-computation. If vectors are ordered so that:
-1. The best candidates appear first
-2. The threshold tightens after just a few vectors
-3. Most remaining vectors fail the early-exit check
-
-Then average distance computation cost drops dramatically—often 2-5x—without any change to recall.
-
 ### Techniques
 - **Centroid-projected ordering:** Sort vectors by `dot(v, centroid)` descending within each posting list
 - **Reference direction sorting:** Use the centroid as a "reference query" and sort by similarity to it
-- **Score upper-bound ordering:** For quantized vectors, sort by maximum possible score (using quantization bounds)
+- **Score upper-bound ordering:** For quantized vectors, sort by maximum possible score
 - **Batch-aware layout:** Group vectors likely to be co-retrieved for better cache locality
-
-### Integration with Existing Phases
-- **Phase 5 (IVF):** Ordering is applied per posting list during index construction
-- **Phase 6 (Quantization):** Quantized codes inherit ordering; asymmetric search benefits from early termination
-- **Phase 4 (SIMD):** Early-exit kernels exploit tight bounds to skip 8-wide iterations
-- **Phase 3 (Zero-Copy):** Ordered layout is written once at compaction, read directly via mmap
 
 ### Deliverables
 - [ ] `sort_posting_list_by_centroid_similarity()` in compaction pipeline
@@ -256,20 +315,6 @@ Then average distance computation cost drops dramatically—often 2-5x—without
 - [ ] Benchmark: measure % of SIMD iterations skipped per query
 - [ ] A/B comparison: ordered vs random posting lists
 
-### File Format Extension
-```
-segment.ivf (extended):
-  [header]
-    ordering_strategy: u8 (0=none, 1=centroid, 2=score_bound)
-  [posting_lists: Vec<u32> × k, ordered by strategy]
-```
-
-### Why This Is Defensible
-- Requires immutable segments (can't reorder in-place efficiently)
-- Requires early-exit kernels (most DBs use full SIMD reductions)
-- Requires IVF (posting lists provide natural reorder boundaries)
-- Retrofitting into existing systems requires rewriting compaction + kernels
-
 **Exit Criteria:**
 - Average SIMD iterations per distance computation reduced by >50%
 - p50 latency improvement of 1.5-2x on IVF queries with nprobe=10
@@ -277,11 +322,11 @@ segment.ivf (extended):
 
 ---
 
-## Phase 8: Multi-Stage Pruning
+## Phase 9: Multi-Stage Pruning
 
 **Objective:** Cascade cheap approximate checks before expensive exact computation.
 
-**Why Eighth:** Combines IVF, quantization, vector ordering, and HNSW into optimal query plan.
+**Why Ninth:** Combines IVF, quantization, vector ordering, and HNSW into optimal query plan.
 
 ### Techniques
 - **Bound propagation:** Use quantized distance as lower bound
@@ -301,31 +346,18 @@ segment.ivf (extended):
 
 ---
 
-## Phase 9: Query-Adaptive Index Resolution (QAIR)
+## Phase 10: Query-Adaptive Index Resolution (QAIR)
 
 **Objective:** Dynamically adjust index work per-query based on confidence signals, reducing median latency for "easy" queries while maintaining accuracy for "hard" queries.
 
-**Why Ninth:** Static ANN parameters (nprobe, rerank depth, quantization level) are tuned for worst-case queries. Most queries are not worst-case. QAIR exploits this distribution to do less work on average without sacrificing tail accuracy.
+**Why Tenth:** Static ANN parameters (nprobe, rerank depth, quantization level) are tuned for worst-case queries. Most queries are not worst-case. QAIR exploits this distribution to do less work on average.
 
-### Why This Is Not Commonly Implemented
-- Requires instrumented query path to compute confidence cheaply
-- Requires multi-stage pipeline (can't adapt what you don't have)
-- Risk-averse systems prefer static parameters with predictable behavior
-- Academic benchmarks measure fixed-parameter recall, not adaptive latency
-- Stateful databases struggle with per-query adaptation (session state, caching)
-
-### Core Insight
-Query difficulty varies. A query near a dense cluster centroid is "easy"—the top-k results are obvious and tightly clustered. A query equidistant from multiple centroids is "hard"—results are spread across clusters with similar scores.
-
-Tidepool's stateless architecture makes per-query adaptation trivial: each query is independent, parameters are chosen at query time, and there's no session state to corrupt.
-
-### Confidence Signals (Computed After Centroid Routing)
+### Confidence Signals
 | Signal | Computation | Interpretation |
 |--------|-------------|----------------|
-| **Centroid gap** | `dist(q, c1) - dist(q, c2)` | Large gap → high confidence, one cluster dominates |
-| **Score entropy** | `-Σ p_i log(p_i)` over top-k centroid scores | Low entropy → confident, high → ambiguous |
-| **Query norm** | `\|\|q\|\|` | Extreme norms may indicate adversarial/OOD queries |
-| **Top-k variance** | Variance of distances in initial top-k | Low variance → results are interchangeable |
+| **Centroid gap** | `dist(q, c1) - dist(q, c2)` | Large gap → high confidence |
+| **Score entropy** | `-Σ p_i log(p_i)` over top-k centroid scores | Low entropy → confident |
+| **Top-k variance** | Variance of distances in initial top-k | Low variance → interchangeable |
 
 ### Adaptive Parameters
 | Parameter | High Confidence | Low Confidence |
@@ -333,69 +365,125 @@ Tidepool's stateless architecture makes per-query adaptation trivial: each query
 | `nprobe` | 1-3 clusters | 10-20 clusters |
 | `rerank_depth` | 1x top-k | 3-5x top-k |
 | `quantization` | SQ8 only | SQ8 → f16 → f32 cascade |
-| `early_exit_threshold` | Aggressive | Conservative |
-
-### Integration with Existing Phases
-- **Phase 5 (IVF):** Centroid distances provide confidence signals
-- **Phase 6 (Quantization):** Adaptive precision selection per query
-- **Phase 7 (Ordering):** Early-exit thresholds adjusted by confidence
-- **Phase 8 (Pruning):** Cascade depth controlled by confidence
-
-### Algorithm
-```
-fn qair_search(query, k):
-    // Stage 1: Route to centroids (always cheap)
-    centroid_scores = compute_centroid_distances(query)
-    
-    // Stage 2: Compute confidence
-    gap = centroid_scores[1] - centroid_scores[0]
-    confidence = sigmoid(gap / calibration_constant)
-    
-    // Stage 3: Select parameters
-    nprobe = lerp(MAX_NPROBE, MIN_NPROBE, confidence)
-    rerank_factor = lerp(5.0, 1.0, confidence)
-    
-    // Stage 4: Execute with adapted parameters
-    candidates = ivf_search(query, k * rerank_factor, nprobe)
-    results = rerank(candidates, k, precision_for_confidence(confidence))
-    
-    return results
-```
 
 ### Deliverables
 - [ ] `QairConfig` struct with calibration parameters
-- [ ] `compute_query_confidence()` function (centroid gap + entropy)
-- [ ] `adapt_search_params()` mapping confidence → nprobe, rerank_depth
-- [ ] Calibration tool: run sample queries to tune confidence thresholds
-- [ ] Metrics: track confidence distribution, parameter selection histogram
+- [ ] `compute_query_confidence()` function
+- [ ] `adapt_search_params()` mapping confidence → parameters
+- [ ] Calibration tool for tuning thresholds
 - [ ] Config flag: `adaptive: bool` to enable/disable QAIR
-
-### Calibration Process
-1. Sample 10k representative queries
-2. Run each with maximum parameters (ground truth)
-3. Measure confidence signals for each query
-4. Find thresholds that achieve target recall at each confidence level
-5. Store calibration in segment metadata
-
-### Why This Is Defensible
-- Requires multi-stage pipeline (most DBs have monolithic search)
-- Requires stateless architecture (no session state to manage)
-- Requires IVF (confidence signals come from centroid routing)
-- Retrofitting requires instrumenting the entire query path
 
 **Exit Criteria:**
 - p50 latency reduced by 30-50% vs static parameters
 - p99 recall matches static parameters (no tail regression)
-- <5% overhead for confidence computation
-- Confidence signal correlates with actual query difficulty (r² > 0.7)
 
 ---
 
-## Phase 10: System-Level Optimization
+## Phase 11: Full-Text Search
+
+**Objective:** Add BM25-based full-text search and hybrid vector+text retrieval.
+
+**Why Eleventh:** Many use cases require combining semantic (vector) search with keyword (text) search. Hybrid retrieval consistently outperforms either approach alone.
+
+### Architecture
+
+```
+Document:
+  id: "doc-123"
+  vector: [0.1, 0.2, ...]        # For semantic search
+  text: "full text content"      # For BM25 search (new)
+  attributes: {...}              # For filtering
+
+Query:
+  vector: [0.1, 0.2, ...]        # Semantic query
+  text: "keyword search"         # Text query (new)
+  mode: "hybrid" | "vector" | "text"
+  alpha: 0.7                     # Blend factor (new)
+```
+
+### Techniques
+- **Inverted index:** Term → document IDs with term frequencies
+- **BM25 scoring:** Standard Okapi BM25 with configurable k1 and b parameters
+- **Tokenization:** Unicode-aware tokenizer with stemming support
+- **Hybrid scoring:** `score = alpha * vector_score + (1 - alpha) * bm25_score`
+- **Reciprocal Rank Fusion (RRF):** Alternative fusion method
+
+### Deliverables
+- [ ] `TextIndex` struct with inverted index and document frequencies
+- [ ] Tokenizer with configurable stopwords and stemming
+- [ ] BM25 scorer implementation
+- [ ] Text index serialization format (`.tpti` files)
+- [ ] `text_search()` returning ranked document IDs
+- [ ] `hybrid_search()` combining vector and text results
+- [ ] Fusion methods: linear blend, RRF
+- [ ] Config: `TEXT_INDEX_ENABLED`, `BM25_K1`, `BM25_B`
+
+### File Format
+```
+segment.tpti (TPTI magic):
+  [header]
+    magic: [u8; 4] = "TPTI"
+    version: u32 = 1
+    doc_count: u32
+    term_count: u32
+    avg_doc_length: f32
+  [vocabulary: term → term_id mapping]
+  [posting_lists: term_id → Vec<(doc_id, term_freq)>]
+  [doc_lengths: doc_id → length]
+```
+
+### Query Flow (Hybrid)
+```
+1. If mode == "vector" or "hybrid":
+   vector_results = segment_search(query.vector)
+   
+2. If mode == "text" or "hybrid":
+   text_results = text_search(query.text)
+   
+3. If mode == "hybrid":
+   results = fuse(vector_results, text_results, alpha)
+else:
+   results = vector_results or text_results
+   
+4. return top_k results
+```
+
+### API Changes
+```json
+// Query request (extended)
+{
+  "vector": [0.1, 0.2, ...],
+  "text": "search keywords",
+  "mode": "hybrid",
+  "alpha": 0.7,
+  "top_k": 10
+}
+
+// Upsert request (extended)
+{
+  "vectors": [
+    {
+      "id": "doc-1",
+      "vector": [0.1, 0.2, ...],
+      "text": "full document text for BM25 indexing",
+      "attributes": {...}
+    }
+  ]
+}
+```
+
+**Exit Criteria:**
+- BM25 search latency <50ms at 1M documents
+- Hybrid retrieval improves relevance over vector-only (measured on standard benchmarks)
+- Text index adds <50% to segment size
+
+---
+
+## Phase 12: System-Level Optimization
 
 **Objective:** Optimize end-to-end system behavior: cold starts, parallelism, resource management.
 
-**Why Tenth:** After algorithmic optimizations, system-level effects dominate.
+**Why Twelfth:** After algorithmic optimizations, system-level effects dominate.
 
 ### Deliverables
 - [ ] **Parallel segment search:** Rayon or tokio parallelism across segments
@@ -417,17 +505,18 @@ fn qair_search(query, k):
 
 ---
 
-## Phase 11: Advanced Features (Future)
+## Phase 13: Advanced Features (Future)
 
 **Objective:** Extend functionality without compromising core performance.
 
 ### Planned
-- [ ] Hybrid search (vector + BM25)
-- [ ] Metadata indexes (B-tree on attributes)
-- [ ] Multi-vector documents
+- [ ] Multi-vector documents (e.g., late interaction models like ColBERT)
 - [ ] Streaming/pagination for large result sets
 - [ ] Namespace-level configuration
 - [ ] Backup/restore utilities
+- [ ] Metadata indexes (B-tree on attributes)
+- [ ] Geo-spatial filtering
+- [ ] Multi-tenancy with isolation
 
 ---
 
@@ -436,98 +525,48 @@ fn qair_search(query, k):
 | Metric | Target | Phase |
 |--------|--------|-------|
 | Query latency p50 (100k vectors) | <20ms | 4 |
-| Query latency p99 (1M vectors) | <100ms | 8 |
-| Query latency p50 (1M vectors) | <30ms | 9 (QAIR) |
+| Query latency p99 (1M vectors) | <100ms | 9 |
+| Query latency p50 (1M vectors) | <30ms | 10 (QAIR) |
+| Write-to-query latency | <1s | 7 |
 | Ingest throughput | >10k docs/sec | 3 |
 | Memory per vector (128-dim) | <256 bytes | 6 |
-| Cold start time | <2s | 10 |
+| Cold start time | <2s | 12 |
 | Recall@10 | >95% | 5 |
-| SIMD early-exit rate | >50% | 7 |
+| SIMD early-exit rate | >50% | 8 |
+| BM25 search latency | <50ms | 11 |
 
 ---
 
 ## Novel Optimization Summary
 
-Tidepool is fast not just because it uses ANN—but because it exploits **data layout**, **bounds tightening**, and **per-query adaptation** in ways most vector databases cannot:
+Tidepool is fast not just because it uses ANN—but because it exploits **data layout**, **bounds tightening**, **real-time streaming**, and **per-query adaptation** in ways most vector databases cannot:
 
 | Optimization | Why Tidepool Can Do This | Why Others Can't |
 |--------------|--------------------------|------------------|
+| **Real-Time Updates** | Redis pub/sub + in-memory buffer | Requires coordination layer |
 | **Deterministic Vector Ordering** | Immutable segments written once at compaction | Mutable indexes can't maintain ordering |
 | **Early-Exit SIMD Kernels** | Full control over distance computation | Most DBs use library BLAS/LAPACK |
 | **Query-Adaptive Resolution** | Stateless architecture, no session state | Stateful DBs risk consistency issues |
 | **Zero-Copy mmap** | Binary-stable segment format | Serialization formats require parsing |
-
-These optimizations compound: ordered vectors feed early-exit kernels, which feed adaptive resolution, which reduces total work. The result is a system where **median latency is 2-3x better than naive ANN** without sacrificing tail recall.
+| **Hybrid Search** | Unified segment format with text index | Separate systems for vector and text |
 
 ---
 
 ## Ordering Rationale
 
 ```
-Foundation → HNSW → Zero-Copy → SIMD → IVF → Quantization → Ordering → Pruning → QAIR → System
-     ↓          ↓         ↓        ↓       ↓         ↓           ↓          ↓        ↓        ↓
-  Correct    Fast     Efficient  Faster  Scalable  Compact    Layout    Cascade  Adaptive  Production
+Foundation → HNSW → Zero-Copy → SIMD → IVF → Quantization → Real-Time → Ordering → Pruning → QAIR → Full-Text → System
+     ↓          ↓         ↓        ↓       ↓         ↓           ↓           ↓          ↓        ↓         ↓          ↓
+  Correct    Fast     Efficient  Faster  Scalable  Compact    Instant     Layout    Cascade  Adaptive  Hybrid   Production
 ```
 
 Each phase builds on the previous. Skipping phases creates technical debt:
 - SIMD without zero-copy wastes cycles on memcpy
 - IVF without SIMD makes cluster search slow
 - Quantization without IVF has nowhere to apply asymmetric search
+- **Real-time without foundation has no segments to search**
 - **Ordering without IVF has no posting lists to reorder**
 - **Ordering without SIMD has no early-exit to exploit**
 - Pruning requires all prior techniques to cascade effectively
 - **QAIR without pruning has nothing to adapt**
-- **QAIR without IVF has no confidence signals**
-
----
-
-## Implementation Plan (Phase 6: Quantization)
-
-**Goal:** Reduce memory footprint and improve cache efficiency with controlled recall loss, while keeping the existing f32 path and file format fully backward compatible.
-
-### Scope and Principles
-- Backward compatibility: v1/v2 segment readers must continue to load.
-- Incremental rollout: quantization is opt-in via config flags and per-segment metadata.
-- Mixed precision: quantized scan always supports f32 rerank.
-- Determinism: quantization outputs must be stable given identical inputs.
-
-### Design Decisions (Lock First)
-- [ ] **Format strategy:** choose **new segment format** (TPV3) vs **sidecar file** (e.g., `.tpq`).
-  - TPV3: fastest read path, more invasive migrations.
-  - Sidecar: safer rollout, slightly more IO.
-- [ ] **Quantization kinds:** `none | f16 | sq8` with room for PQ later.
-- [ ] **Calibration storage:** per-dimension min/max for SQ8 (stored in header or sidecar).
-
-### Data Model and Config
-- [ ] Add `QuantizationKind` enum and metadata in `crates/tidepool-common/src/segment_v2.rs` (or new `segment_v3.rs`).
-- [ ] Extend writer options in `crates/tidepool-common/src/segment.rs` to accept quantization settings.
-- [ ] Wire config flags in `crates/tidepool-common/src/config.rs` (e.g., `QUANTIZATION=none|f16|sq8`).
-
-### Writer Path (Compaction)
-- [ ] **f16:** quantize vectors on write, store f16 payload in segment.
-- [ ] **SQ8:** compute per-dimension min/max, quantize vectors to i8, store scales/offsets.
-- [ ] Persist quantization metadata (kind, dims, calibration) alongside segment payload.
-- [ ] Keep f32 vectors optional (for rerank) based on a flag.
-
-### Reader and Search Path
-- [ ] Load quantization metadata and expose accessors in segment view.
-- [ ] Implement asymmetric distance:
-  - f16: convert to f32 during distance or add f16 kernels.
-  - SQ8: `dot(q_f32, db_i8) * scale + bias` (metric-aware).
-- [ ] Add mixed-precision rerank in `crates/tidepool-common/src/segment.rs`:
-  - Stage 1: quantized scan to top-k * R.
-  - Stage 2: f32 rerank to top-k.
-
-### SIMD and Kernels
-- [ ] f16 kernel path in `crates/tidepool-common/src/simd.rs` (optional).
-- [ ] SQ8 dot product path; ensure scalar fallback is correct and tested.
-
-### Tests
-- [ ] Round-trip tests for quantized segment read/write.
-- [ ] Recall tests vs f32 baseline at fixed k and nprobe.
-- [ ] Determinism tests: same input produces identical quantized output.
-
-### Benchmarks and Exit Gates
-- [ ] Memory per vector improved by 2x (f16) and 4x (SQ8).
-- [ ] Recall@10 >= 95% vs f32 baseline for SQ8.
-- [ ] Latency regression <= 10% at p50 (with rerank enabled).
+- **Full-text without foundation has no storage backend**
