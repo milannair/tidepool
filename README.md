@@ -542,11 +542,47 @@ If the build fails with `no Rust files in /app`, ensure the service is configure
 - Use `NAMESPACE` to lock single-tenant deployments for lower memory
 - Attach volume at `/data` for segment caching (reduces S3 reads)
 
+## Client Libraries
+
+Official client libraries are available for:
+
+| Language | Package | Install |
+|----------|---------|---------|
+| Python | [tidepool](https://github.com/milannair/tidepool-python) | `pip install tidepool` |
+| TypeScript | [tidepool-client](https://github.com/milannair/tidepool-typescript) | `npm install tidepool-client` |
+| Go | [tidepool-go](https://github.com/milannair/tidepool-go) | `go get github.com/milannair/tidepool-go` |
+
 ## Current Limitations
 
 - No cursor-based pagination for result sets exceeding `top_k`
 - Text search requires documents to have `text` field populated
 - Hybrid search requires both `vector` and `text` in documents for best results
+
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes
+4. Run tests (`cargo test --all`)
+5. Run clippy (`cargo clippy --all -- -D warnings`)
+6. Format code (`cargo fmt --all`)
+7. Commit your changes (`git commit -m 'Add amazing feature'`)
+8. Push to the branch (`git push origin feature/amazing-feature`)
+9. Open a Pull Request
+
+### Areas for Contribution
+
+- Bug fixes and performance improvements
+- Documentation improvements
+- Client library improvements
+- New features (please open an issue first to discuss)
+
+## Support
+
+- **Issues**: [GitHub Issues](https://github.com/milannair/tidepool/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/milannair/tidepool/discussions)
 
 ## License
 
