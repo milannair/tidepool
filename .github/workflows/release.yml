@@ -20,10 +20,8 @@ jobs:
       matrix:
         service:
           - name: query
-            dockerfile: query/Dockerfile
             image: tidepool-query
           - name: ingest
-            dockerfile: ingest/Dockerfile
             image: tidepool-ingest
 
     steps:
@@ -59,7 +57,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.service.dockerfile }}
+          file: Dockerfile
+          build-args: |
+            SERVICE=${{ matrix.service.name }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
