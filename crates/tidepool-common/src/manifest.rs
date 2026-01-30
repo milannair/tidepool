@@ -23,6 +23,9 @@ pub struct Manifest {
     pub segments: Vec<Segment>,
     #[serde(default)]
     pub dimensions: usize,
+    /// Generation ID for atomic activation (monotonically increasing).
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -33,6 +36,15 @@ pub struct Segment {
     pub doc_count: i64,
     #[serde(default)]
     pub dimensions: usize,
+    /// Segment size in bytes (for disk budget and priority).
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Content hash for Merkle-based sync (SHA-256, 32 bytes as hex string).
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Object key for Bloom filter (e.g. "namespaces/ns/segments/id.bloom").
+    #[serde(default)]
+    pub bloom_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -142,7 +154,8 @@ impl<S: Store> Manager<S> {
     }
 }
 
-fn parse_manifest_bytes(data: &[u8]) -> Result<Manifest, StorageError> {
+/// Parse manifest from rkyv bytes (e.g. from storage).
+pub fn parse_manifest_bytes(data: &[u8]) -> Result<Manifest, StorageError> {
     let archived = unsafe { rkyv::archived_root::<Manifest>(data) };
     let manifest: Manifest = archived
         .deserialize(&mut rkyv::Infallible)
@@ -152,6 +165,10 @@ fn parse_manifest_bytes(data: &[u8]) -> Result<Manifest, StorageError> {
 
 impl Manifest {
     pub fn new(segments: Vec<Segment>) -> Self {
+        Self::new_with_generation(segments, 1)
+    }
+
+    pub fn new_with_generation(segments: Vec<Segment>, generation: u64) -> Self {
         let dimensions = segments.first().map(|s| s.dimensions).unwrap_or(0);
         Self {
             version: format!(
@@ -165,10 +182,15 @@ impl Manifest {
                 .unwrap_or_else(|| Utc::now().timestamp_millis() * 1_000_000),
             segments,
             dimensions,
+            generation,
         }
     }
 
     pub fn total_doc_count(&self) -> i64 {
         self.segments.iter().map(|s| s.doc_count).sum()
+    }
+
+    pub fn total_size_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.size_bytes).sum()
     }
 }

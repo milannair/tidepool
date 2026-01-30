@@ -9,10 +9,11 @@ use axum::{Json, Router};
 use tokio::signal;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tidepool_common::config::Config;
 use tidepool_common::document::{DeleteRequest, DeleteResponse, UpsertRequest, UpsertResponse};
+use tidepool_common::redis::RedisStore;
 use tidepool_common::segment::WriterOptions;
 use tidepool_common::storage::S3Store;
 
@@ -50,6 +51,23 @@ async fn main() {
         }
     };
 
+    // Initialize Redis if configured
+    let redis = if let Some(redis_url) = &cfg.redis_url {
+        match RedisStore::new(redis_url, &cfg.redis_prefix, cfg.redis_wal_ttl_secs).await {
+            Ok(store) => {
+                info!("Redis connected for hot buffer sharing");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                warn!("Failed to connect to Redis (continuing without): {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Redis not configured, using S3-only mode");
+        None
+    };
+
     let writer_options = WriterOptions {
         hnsw_m: cfg.hnsw_m,
         hnsw_ef_construction: cfg.hnsw_ef_construction,
@@ -68,7 +86,7 @@ async fn main() {
         ..WriterOptions::default()
     };
 
-    let namespaces = Arc::new(NamespaceManager::new(
+    let namespaces = Arc::new(NamespaceManager::new_with_redis(
         storage,
         writer_options,
         cfg.wal_batch_max_entries,
@@ -78,6 +96,7 @@ async fn main() {
         cfg.max_namespaces,
         cfg.namespace_idle_timeout,
         cfg.namespace.clone(),
+        redis,
     ));
 
     let state = AppState {

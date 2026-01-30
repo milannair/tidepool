@@ -2,7 +2,7 @@
 
 Fast, S3-native vector database for scalable similarity search.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/SLVepB?referralCode=58OUHt&utm_medium=integration&utm_source=template&utm_campaign=generic)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/uIyjpz?referralCode=58OUHt&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 A high-performance vector database designed for cost-effective deployment on cloud infrastructure. Tidepool uses object storage (S3, R2, MinIO) as the primary data store, enabling horizontal scaling without the complexity of distributed consensus.
 

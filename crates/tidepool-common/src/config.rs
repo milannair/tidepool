@@ -14,6 +14,10 @@ pub struct Config {
     pub aws_region: String,
     pub bucket_name: String,
     pub cache_dir: String,
+    /// Local data directory for query service (default /data). Sync writes here.
+    pub data_dir: String,
+    /// Background sync interval for query service (default 5s).
+    pub sync_interval: Duration,
     pub namespace: Option<String>,
     pub allowed_namespaces: Option<Vec<String>>,
     pub max_namespaces: Option<usize>,
@@ -56,6 +60,28 @@ pub struct Config {
     pub text_stopwords: Option<Vec<String>>,
     pub text_min_token_len: usize,
     pub text_max_token_len: usize,
+    // Segment sizing
+    /// Target segment size in bytes (default 128 MB).
+    pub target_segment_size: usize,
+    /// Minimum segment size - merge segments below this (default 16 MB).
+    pub min_segment_size: usize,
+    /// Maximum segment size - split segments above this (default 256 MB).
+    pub max_segment_size: usize,
+    // Disk budget (query service)
+    /// Maximum local disk usage for segment data in bytes (default 10 GB).
+    pub max_local_disk: usize,
+    /// Target local disk usage after eviction in bytes (default 8 GB).
+    pub target_local_disk: usize,
+    /// If true, download all segments eagerly at startup (default false).
+    pub eager_sync_all: bool,
+    // Redis configuration
+    /// Redis URL for hot buffer sharing (default: none, disables Redis).
+    /// Example: redis://localhost:6379
+    pub redis_url: Option<String>,
+    /// Redis key prefix for namespacing (default: "tidepool").
+    pub redis_prefix: String,
+    /// TTL for Redis WAL entries in seconds (default: 3600 = 1 hour).
+    pub redis_wal_ttl_secs: u64,
 }
 
 impl Config {
@@ -67,6 +93,8 @@ impl Config {
             aws_region: get_env_with_fallback("AWS_DEFAULT_REGION", "AWS_REGION"),
             bucket_name: get_env_with_fallback("AWS_S3_BUCKET_NAME", "BUCKET_NAME"),
             cache_dir: env::var("CACHE_DIR").unwrap_or_else(|_| "/data".to_string()),
+            data_dir: env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
+            sync_interval: parse_duration_fallback("SYNC_INTERVAL", Duration::from_secs(5)),
             namespace: parse_optional_string("NAMESPACE"),
             allowed_namespaces: parse_optional_csv("ALLOWED_NAMESPACES"),
             max_namespaces: parse_optional_usize("MAX_NAMESPACES"),
@@ -108,6 +136,18 @@ impl Config {
             text_stopwords: parse_optional_csv("TEXT_STOPWORDS"),
             text_min_token_len: parse_usize("TEXT_MIN_TOKEN_LEN", 2),
             text_max_token_len: parse_usize("TEXT_MAX_TOKEN_LEN", 32),
+            // Segment sizing (128 MB target, 16 MB min, 256 MB max)
+            target_segment_size: parse_usize("TARGET_SEGMENT_SIZE", 128 * 1024 * 1024),
+            min_segment_size: parse_usize("MIN_SEGMENT_SIZE", 16 * 1024 * 1024),
+            max_segment_size: parse_usize("MAX_SEGMENT_SIZE", 256 * 1024 * 1024),
+            // Disk budget (10 GB max, 8 GB target)
+            max_local_disk: parse_usize("MAX_LOCAL_DISK", 10 * 1024 * 1024 * 1024),
+            target_local_disk: parse_usize("TARGET_LOCAL_DISK", 8 * 1024 * 1024 * 1024),
+            eager_sync_all: parse_bool("EAGER_SYNC_ALL", false),
+            // Redis configuration
+            redis_url: parse_optional_string("REDIS_URL"),
+            redis_prefix: env::var("REDIS_PREFIX").unwrap_or_else(|_| "tidepool".to_string()),
+            redis_wal_ttl_secs: parse_usize("REDIS_WAL_TTL_SECS", 3600) as u64,
         };
 
         cfg.validate()?;

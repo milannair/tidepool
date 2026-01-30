@@ -79,6 +79,17 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
         names
     }
 
+    /// Reload manifest, segments, and tombstones for all cached engines (e.g. after background sync).
+    pub async fn reload_all_engines(&self) {
+        let engines: Vec<Arc<Engine<S>>> = {
+            let guard = self.namespaces.read().await;
+            guard.values().map(|e| e.engine.clone()).collect()
+        };
+        for engine in engines {
+            let _ = engine.reload_segments().await;
+        }
+    }
+
     pub async fn get_engine(&self, namespace: &str) -> Result<Arc<Engine<S>>, NamespaceError> {
         if !self.is_allowed(namespace) {
             return Err(NamespaceError::NotAllowed);
@@ -136,8 +147,8 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
             evicted.invalidate_cache().await;
         }
 
-        if let Err(err) = engine.load_manifest().await {
-            warn!("Failed to load manifest for namespace {}: {}", namespace, err);
+        if let Err(err) = engine.reload_segments().await {
+            warn!("Failed to load state for namespace {}: {}", namespace, err);
         }
 
         Ok(engine)

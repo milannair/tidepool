@@ -41,12 +41,15 @@ async fn engine_query_with_filters() {
         segment_key: seg.segment_key.clone(),
         doc_count: seg.doc_count,
         dimensions: seg.dimensions,
+        size_bytes: seg.size_bytes,
+        content_hash: Some(seg.content_hash.clone()),
+        bloom_key: Some(seg.bloom_key.clone()),
     }]);
     let manager = Manager::new(store.clone(), namespace);
     manager.save(&manifest).await.unwrap();
 
     let engine = Engine::new(store.clone(), namespace.to_string(), None);
-    let _ = engine.load_manifest().await.unwrap();
+    engine.reload_segments().await.unwrap();
 
     let req = QueryRequest {
         vector: vec![1.0, 0.0],
@@ -95,12 +98,15 @@ async fn engine_query_text_only() {
         segment_key: seg.segment_key.clone(),
         doc_count: seg.doc_count,
         dimensions: seg.dimensions,
+        size_bytes: seg.size_bytes,
+        content_hash: Some(seg.content_hash.clone()),
+        bloom_key: Some(seg.bloom_key.clone()),
     }]);
     let manager = Manager::new(store.clone(), namespace);
     manager.save(&manifest).await.unwrap();
 
     let engine = Engine::new(store.clone(), namespace.to_string(), None);
-    let _ = engine.load_manifest().await.unwrap();
+    engine.reload_segments().await.unwrap();
 
     let req = QueryRequest {
         vector: Vec::new(),

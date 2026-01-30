@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tidepool_common::document::Document;
 use tidepool_common::manifest::{Manager, Manifest};
+use tidepool_common::redis::RedisStore;
 use tidepool_common::segment::{Writer, WriterOptions};
 use tidepool_common::storage::{Store, StorageError};
 use tidepool_common::tombstone::Manager as TombstoneManager;
@@ -14,21 +15,35 @@ use tidepool_common::wal::{DeserializedEntry, Reader as WalReader};
 
 #[derive(Clone)]
 pub struct Compactor<S: Store + Clone> {
+    namespace: String,
     wal_reader: WalReader<S>,
     segment_writer: Writer<S>,
     manifest_manager: Manager<S>,
     tombstone_manager: TombstoneManager<S>,
+    redis: Option<Arc<RedisStore>>,
     last_run: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 impl<S: Store + Clone> Compactor<S> {
+    #[allow(dead_code)]
     pub fn new_with_options(storage: S, namespace: impl Into<String>, opts: WriterOptions) -> Self {
+        Self::new_with_redis(storage, namespace, opts, None)
+    }
+
+    pub fn new_with_redis(
+        storage: S,
+        namespace: impl Into<String>,
+        opts: WriterOptions,
+        redis: Option<Arc<RedisStore>>,
+    ) -> Self {
         let namespace = namespace.into();
         Self {
+            namespace: namespace.clone(),
             wal_reader: WalReader::new(storage.clone(), &namespace),
             segment_writer: Writer::new_with_options(storage.clone(), &namespace, opts),
             manifest_manager: Manager::new(storage.clone(), &namespace),
             tombstone_manager: TombstoneManager::new(storage, &namespace),
+            redis,
             last_run: Arc::new(RwLock::new(None)),
         }
     }
@@ -113,11 +128,19 @@ impl<S: Store + Clone> Compactor<S> {
                 seg.id, seg.doc_count, seg.dimensions
             );
 
+            // ManifestSegment guarantees these are populated by write_segment()
+            if seg.content_hash.is_empty() || seg.bloom_key.is_empty() {
+                return Err(format!("segment {} missing content_hash or bloom_key", seg.id));
+            }
+
             segments.push(tidepool_common::manifest::Segment {
                 id: seg.id.clone(),
                 segment_key: seg.segment_key.clone(),
                 doc_count: seg.doc_count,
                 dimensions: seg.dimensions,
+                size_bytes: seg.size_bytes,
+                content_hash: Some(seg.content_hash.clone()),
+                bloom_key: Some(seg.bloom_key.clone()),
             });
         } else {
             info!("No vectors to compact, applying tombstones only");
@@ -136,7 +159,13 @@ impl<S: Store + Clone> Compactor<S> {
             tombstones.remove(&doc.id);
         }
 
-        let mut new_manifest = Manifest::new(segments);
+        // Increment generation from previous manifest (or start at 1)
+        let prev_generation = if let Ok(manifest) = self.manifest_manager.load().await {
+            manifest.generation
+        } else {
+            0
+        };
+        let mut new_manifest = Manifest::new_with_generation(segments, prev_generation + 1);
         if new_manifest.dimensions == 0 {
             new_manifest.dimensions = dims;
         }
@@ -153,10 +182,59 @@ impl<S: Store + Clone> Compactor<S> {
 
         self.delete_wal_files(&wal_files).await;
 
+        // Trim Redis WAL if enabled
+        if let Some(redis) = &self.redis {
+            self.trim_redis_wal(redis).await;
+        }
+
         *self.last_run.write().await = Some(Utc::now());
 
         info!("Compaction complete: {} vectors", new_manifest.total_doc_count());
         Ok(())
+    }
+
+    /// Trim Redis WAL entries that have been compacted
+    async fn trim_redis_wal(&self, redis: &RedisStore) {
+        // Get current stream length first
+        match redis.wal_len(&self.namespace).await {
+            Ok(len) if len == 0 => {
+                debug!("Redis WAL is empty, nothing to trim");
+                return;
+            }
+            Ok(len) => {
+                debug!("Redis WAL has {} entries before trim", len);
+            }
+            Err(e) => {
+                warn!("Failed to get Redis WAL length: {}", e);
+                return;
+            }
+        }
+
+        // Read all entries to find the last one
+        match redis.read_wal(&self.namespace, None, None).await {
+            Ok(entries) if entries.is_empty() => {
+                debug!("No Redis WAL entries to trim");
+            }
+            Ok(entries) => {
+                if let Some(last) = entries.last() {
+                    // Trim all entries up to and including the last one
+                    match redis.trim_wal(&self.namespace, &last.id).await {
+                        Ok(trimmed) => {
+                            info!(
+                                "Trimmed {} entries from Redis WAL for namespace {}",
+                                trimmed, self.namespace
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to trim Redis WAL: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read Redis WAL for trimming: {}", e);
+            }
+        }
     }
 
     pub async fn run_periodically(&self, interval: std::time::Duration) {

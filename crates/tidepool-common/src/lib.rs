@@ -1,9 +1,11 @@
 pub mod attributes;
+pub mod bloom;
 pub mod config;
 pub mod document;
 pub mod index;
 pub mod manifest;
 pub mod quantization;
+pub mod redis;
 pub mod segment;
 pub mod segment_v2;
 pub mod simd;

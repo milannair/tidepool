@@ -100,6 +100,19 @@ pub struct QueryRequest {
 pub struct QueryResponse {
     pub results: Vec<VectorResult>,
     pub namespace: String,
+    /// True if some segments are still being downloaded (partial results).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub warming: bool,
+    /// Number of segments that were searched.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub available_segments: usize,
+    /// Total segments in manifest (available + pending).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_segments: usize,
+}
+
+fn is_zero(val: &usize) -> bool {
+    *val == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,6 +23,7 @@ use crate::index::text::TextIndex;
 use crate::quantization::{self, QuantizationKind, QuantizedVectors, Sq8Query};
 use crate::segment_v2::{self, compute_norm, write_segment_v2, write_segment_v3, is_v2_format, is_v3_format, SegmentLayout, SegmentView};
 use crate::storage::{
+    segment_bloom_path,
     segment_index_path,
     segment_ivf_path,
     segment_path,
@@ -210,9 +211,30 @@ impl<S: Store> Writer<S> {
         } else {
             write_segment_v2(docs)?
         };
+        let segment_size_bytes = buf.len() as u64;
+
+        // Compute content hash (SHA-256)
+        use sha2::{Digest as Sha2Digest, Sha256};
+        let content_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(&buf);
+            format!("{:x}", hasher.finalize())
+        };
 
         let segment_key = segment_path(&self.namespace, &segment_id);
         self.storage.put(&segment_key, buf).await?;
+
+        // Build and write Bloom filter for document IDs
+        let bloom_key = segment_bloom_path(&self.namespace, &segment_id);
+        let mut bloom = crate::bloom::BloomFilter::for_segment(docs.len());
+        for doc in docs {
+            bloom.insert(&doc.id);
+        }
+        let bloom_data = bloom.to_bytes();
+        if let Err(err) = self.storage.put(&bloom_key, bloom_data).await {
+            let _ = self.storage.delete(&segment_key).await;
+            return Err(err);
+        }
 
         let use_ivf = self.opts.ivf_enabled && docs.len() >= self.opts.ivf_min_segment_size;
         let mut quant_key: Option<String> = None;
@@ -309,6 +331,9 @@ impl<S: Store> Writer<S> {
             segment_key,
             doc_count: docs.len() as i64,
             dimensions,
+            size_bytes: segment_size_bytes,
+            content_hash,
+            bloom_key,
         }))
     }
 }
@@ -1346,6 +1371,12 @@ pub struct ManifestSegment {
     pub segment_key: String,
     pub doc_count: i64,
     pub dimensions: usize,
+    /// Segment size in bytes.
+    pub size_bytes: u64,
+    /// Content hash (SHA-256 hex string).
+    pub content_hash: String,
+    /// Object key for Bloom filter.
+    pub bloom_key: String,
 }
 
 #[cfg(test)]

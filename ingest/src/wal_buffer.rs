@@ -1,12 +1,15 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, warn};
 
 use tidepool_common::document::Document;
+use tidepool_common::document::RkyvDocument;
+use tidepool_common::redis::RedisStore;
 use tidepool_common::storage::{Store, StorageError};
 use tidepool_common::wal::{Entry, Writer as WalWriter};
-use tidepool_common::document::RkyvDocument;
 
 struct WalRequest {
     entries: Vec<Entry>,
@@ -20,7 +23,19 @@ pub struct BufferedWalWriter<S: Store + Clone + Send + Sync + 'static> {
 }
 
 impl<S: Store + Clone + Send + Sync + 'static> BufferedWalWriter<S> {
+    #[allow(dead_code)]
     pub fn new(writer: WalWriter<S>, max_entries: usize, flush_interval: Duration) -> Self {
+        Self::new_with_redis(writer, max_entries, flush_interval, None, "".to_string())
+    }
+
+    /// Create a new buffered WAL writer with optional Redis dual-write
+    pub fn new_with_redis(
+        writer: WalWriter<S>,
+        max_entries: usize,
+        flush_interval: Duration,
+        redis: Option<Arc<RedisStore>>,
+        namespace: String,
+    ) -> Self {
         let max_entries = max_entries.max(1);
         let (sender, mut receiver) = mpsc::channel::<WalRequest>(max_entries * 4);
         let flush_every = if flush_interval.is_zero() {
@@ -42,12 +57,12 @@ impl<S: Store + Clone + Send + Sync + 'static> BufferedWalWriter<S> {
                                 entry_count += req.entries.len();
                                 buffer.push(req);
                                 if max_entries > 0 && entry_count >= max_entries {
-                                    flush_batch(&writer, &mut buffer, &mut entry_count).await;
+                                    flush_batch_with_redis(&writer, &mut buffer, &mut entry_count, redis.as_deref(), &namespace).await;
                                 }
                             }
                             None => {
                                 if !buffer.is_empty() {
-                                    flush_batch(&writer, &mut buffer, &mut entry_count).await;
+                                    flush_batch_with_redis(&writer, &mut buffer, &mut entry_count, redis.as_deref(), &namespace).await;
                                 }
                                 break;
                             }
@@ -55,7 +70,7 @@ impl<S: Store + Clone + Send + Sync + 'static> BufferedWalWriter<S> {
                     }
                     _ = ticker.tick() => {
                         if !buffer.is_empty() {
-                            flush_batch(&writer, &mut buffer, &mut entry_count).await;
+                            flush_batch_with_redis(&writer, &mut buffer, &mut entry_count, redis.as_deref(), &namespace).await;
                         }
                     }
                 }
@@ -116,10 +131,12 @@ impl<S: Store + Clone + Send + Sync + 'static> BufferedWalWriter<S> {
     }
 }
 
-async fn flush_batch<S: Store>(
+async fn flush_batch_with_redis<S: Store>(
     writer: &WalWriter<S>,
     buffer: &mut Vec<WalRequest>,
     entry_count: &mut usize,
+    redis: Option<&RedisStore>,
+    namespace: &str,
 ) {
     if buffer.is_empty() {
         return;
@@ -133,6 +150,20 @@ async fn flush_batch<S: Store>(
         responders.push(req.respond_to);
     }
 
+    // Dual-write: Redis first (for real-time visibility), then S3 (for durability)
+    if let Some(redis_store) = redis {
+        match redis_store.append_wal(namespace, &entries).await {
+            Ok(ids) => {
+                debug!("Wrote {} entries to Redis WAL (last id: {:?})", entries.len(), ids.last());
+            }
+            Err(e) => {
+                // Log but don't fail - S3 is the durable store
+                warn!("Failed to write to Redis WAL: {} (S3 write will continue)", e);
+            }
+        }
+    }
+
+    // Always write to S3 for durability
     let result = writer.write_entries(&entries).await.map(|_| ());
     for responder in responders {
         let _ = responder.send(result.as_ref().map(|_| ()).map_err(clone_error));

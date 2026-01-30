@@ -60,6 +60,9 @@ async fn list_namespaces_includes_manifest_and_wal() {
         segment_key: seg.segment_key.clone(),
         doc_count: seg.doc_count,
         dimensions: seg.dimensions,
+        size_bytes: seg.size_bytes,
+        content_hash: Some(seg.content_hash.clone()),
+        bloom_key: Some(seg.bloom_key.clone()),
     }]);
     let manager = Manager::new(store.clone(), "ready");
     manager.save(&manifest).await.unwrap();
