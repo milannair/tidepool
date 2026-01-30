@@ -74,6 +74,14 @@ pub struct Config {
     pub target_local_disk: usize,
     /// If true, download all segments eagerly at startup (default false).
     pub eager_sync_all: bool,
+    // Redis configuration
+    /// Redis URL for hot buffer sharing (default: none, disables Redis).
+    /// Example: redis://localhost:6379
+    pub redis_url: Option<String>,
+    /// Redis key prefix for namespacing (default: "tidepool").
+    pub redis_prefix: String,
+    /// TTL for Redis WAL entries in seconds (default: 3600 = 1 hour).
+    pub redis_wal_ttl_secs: u64,
 }
 
 impl Config {
@@ -136,6 +144,10 @@ impl Config {
             max_local_disk: parse_usize("MAX_LOCAL_DISK", 10 * 1024 * 1024 * 1024),
             target_local_disk: parse_usize("TARGET_LOCAL_DISK", 8 * 1024 * 1024 * 1024),
             eager_sync_all: parse_bool("EAGER_SYNC_ALL", false),
+            // Redis configuration
+            redis_url: parse_optional_string("REDIS_URL"),
+            redis_prefix: env::var("REDIS_PREFIX").unwrap_or_else(|_| "tidepool".to_string()),
+            redis_wal_ttl_secs: parse_usize("REDIS_WAL_TTL_SECS", 3600) as u64,
         };
 
         cfg.validate()?;

@@ -10,16 +10,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tidepool_common::config::Config;
 use tidepool_common::document::QueryRequest;
+use tidepool_common::redis::RedisStore;
 use tidepool_common::storage::{LocalStore, S3Store};
 use tidepool_query::bootstrap::{Bootstrap, Rehydrator};
 use tidepool_query::engine::EngineOptions;
 use tidepool_query::eviction::Evictor;
 use tidepool_query::loader::DataLoader;
 use tidepool_query::namespace_manager::{NamespaceError, NamespaceManager};
+use tidepool_query::redis_sync::RedisHotBufferSync;
 use tidepool_query::sync::BackgroundSync;
 
 #[derive(Clone)]
@@ -114,6 +116,23 @@ async fn main() {
 
     let local_store = LocalStore::new(&cfg.data_dir);
 
+    // Initialize Redis if configured
+    let redis = if let Some(redis_url) = &cfg.redis_url {
+        match RedisStore::new(redis_url, &cfg.redis_prefix, cfg.redis_wal_ttl_secs).await {
+            Ok(store) => {
+                info!("Redis connected for real-time hot buffer");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                warn!("Failed to connect to Redis (continuing without): {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Redis not configured, hot buffer will use local data only");
+        None
+    };
+
     if cfg.hot_buffer_max_size > 0 {
         info!(
             "Hot buffer enabled (buffer size per namespace: {})",
@@ -141,6 +160,17 @@ async fn main() {
         cfg.namespace.clone(),
     );
     let namespaces = Arc::new(namespaces);
+
+    // Start Redis hot buffer sync if Redis is enabled
+    if let Some(redis_store) = redis.clone() {
+        info!("Starting Redis hot buffer sync...");
+        let sync = RedisHotBufferSync::new(
+            redis_store,
+            namespaces.clone(),
+            Duration::from_millis(100), // Poll every 100ms for real-time updates
+        );
+        tokio::spawn(sync.run());
+    }
 
     let sync = BackgroundSync::new(
         s3_store,

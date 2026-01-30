@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   minio:
     image: minio/minio:latest
     ports:
@@ -47,10 +60,13 @@ services:
       MAX_NAMESPACES: 100
       HOT_BUFFER_MAX_SIZE: 10000
       EAGER_SYNC_ALL: "true"
+      REDIS_URL: redis://redis:6379
       RUST_LOG: info
     volumes:
       - query-cache:/data
     depends_on:
+      redis:
+        condition: service_healthy
       minio-init:
         condition: service_completed_successfully
 
@@ -70,11 +86,15 @@ services:
       # NAMESPACE: default  # Removed to enable dynamic namespaces
       MAX_NAMESPACES: 100
       COMPACTION_INTERVAL: 1m
+      REDIS_URL: redis://redis:6379
       RUST_LOG: info
     depends_on:
+      redis:
+        condition: service_healthy
       minio-init:
         condition: service_completed_successfully
 
 volumes:
+  redis-data:
   minio-data:
   query-cache:

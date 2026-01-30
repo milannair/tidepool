@@ -146,6 +146,20 @@ impl<S: Store + Clone + 'static> Engine<S> {
         self.hot_buffer.as_ref()
     }
 
+    /// Insert documents into the hot buffer (for real-time Redis sync).
+    pub async fn hot_buffer_insert(&self, docs: Vec<tidepool_common::document::Document>) {
+        if let Some(buffer) = &self.hot_buffer {
+            buffer.insert(docs).await;
+        }
+    }
+
+    /// Delete documents from the hot buffer (for real-time Redis sync).
+    pub async fn hot_buffer_delete(&self, ids: Vec<String>) {
+        if let Some(buffer) = &self.hot_buffer {
+            buffer.delete(ids).await;
+        }
+    }
+
     pub async fn load_manifest(&self) -> Result<bool, String> {
         let manifest = self
             .manifest_manager
