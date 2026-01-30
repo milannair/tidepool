@@ -7,6 +7,9 @@ This document provides instructions for AI agents working on the Tidepool codeba
 ```
 tidepool/
 ├── Cargo.toml              # Workspace root
+├── Dockerfile              # Single multi-service Dockerfile (SERVICE arg)
+├── railway.toml            # Railway deployment config
+├── railway.json            # Railway template schema
 ├── crates/
 │   └── tidepool-common/    # Shared library (indexes, storage, vectors)
 ├── ingest/                 # Ingest service (writes, compaction)
@@ -81,6 +84,19 @@ cargo test --all -- --nocapture
 ```
 
 ## Running Locally with Docker
+
+### Build Docker Image
+
+The repository uses a single Dockerfile that builds ALL services into one image:
+
+```bash
+# Build the image (contains all services)
+docker build -t tidepool .
+
+# Run specific services
+docker run -p 8080:8080 tidepool /tidepool-query
+docker run -p 8080:8080 tidepool /tidepool-ingest
+```
 
 ### Start the Full Stack
 
@@ -282,6 +298,46 @@ cargo fmt --all
 # Run clippy
 cargo clippy --all -- -D warnings
 ```
+
+## Railway Deployment
+
+The repository is configured as a Railway-compatible template with a single Dockerfile that builds all services into one image.
+
+### How It Works
+
+- The root `Dockerfile` builds ALL service binaries into a single image
+- Each Railway service uses a different **Start Command** to run its binary
+- `tidepool-query` → Start Command: `/tidepool-query`
+- `tidepool-ingest` → Start Command: `/tidepool-ingest`
+
+### Railway Template Settings
+
+For each service in the Railway template, configure:
+
+| Setting | tidepool-query | tidepool-ingest |
+|---------|----------------|-----------------|
+| Start Command | `/tidepool-query` | `/tidepool-ingest` |
+| Healthcheck Path | `/health` | `/health` |
+
+### Adding New Services
+
+To add a new service (e.g., `compactor`):
+
+1. Create the service crate (e.g., `compactor/` with `Cargo.toml` and `src/main.rs`)
+2. Add it to the workspace in `Cargo.toml`
+3. Update the root `Dockerfile`:
+   - Add the `Cargo.toml` copy for dependency caching
+   - Add `-p tidepool-compactor` to the cargo build command
+   - Add `COPY --from=builder` for the new binary
+4. In Railway template, add new service with Start Command: `/tidepool-compactor`
+
+### Template Structure
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Single image containing all service binaries |
+| `railway.toml` | Railway build/deploy configuration |
+| `railway.json` | Railway template schema |
 
 ## Making Changes
 

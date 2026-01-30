@@ -1,0 +1,76 @@
+# Railway configuration for Tidepool
+#
+# This is a monorepo with multiple services. The Dockerfile builds ALL
+# service binaries into a single image. Each Railway service uses a
+# different Start Command to run its specific binary.
+#
+# Services:
+#   - query:  Vector search API (reads from segments + hot buffer)
+#   - ingest: Write API + compaction (writes to WAL, builds segments)
+#
+# Railway Template Settings:
+#   tidepool-query  → Start Command: /tidepool-query
+#   tidepool-ingest → Start Command: /tidepool-ingest
+#
+# =============================================================================
+# Required Environment Variables (set in Railway Dashboard → Variables)
+# =============================================================================
+#
+#   AWS_ACCESS_KEY_ID      - S3/R2 access key
+#   AWS_SECRET_ACCESS_KEY  - S3/R2 secret key  
+#   AWS_ENDPOINT_URL       - S3 endpoint (e.g., https://<account>.r2.cloudflarestorage.com)
+#   AWS_REGION             - S3 region (e.g., auto for R2)
+#   BUCKET_NAME            - S3 bucket name
+#
+# =============================================================================
+# Optional Environment Variables
+# =============================================================================
+#
+# Namespace configuration:
+#   NAMESPACE              - Restrict to a single namespace (unset = dynamic)
+#   ALLOWED_NAMESPACES     - Comma-separated allowlist (optional)
+#   MAX_NAMESPACES         - Max active namespaces per replica (optional)
+#   NAMESPACE_IDLE_TIMEOUT - Evict namespace state after inactivity (e.g., "10m")
+#
+# Query service tuning:
+#   CACHE_DIR              - Local cache directory (default: "/data")
+#   HNSW_EF_SEARCH         - HNSW search quality (default: "100")
+#   IVF_NPROBE_DEFAULT     - IVF clusters to search (default: "10")
+#   QUANTIZATION_RERANK_FACTOR - Rerank multiplier (default: "4")
+#   MAX_TOP_K              - Maximum results per query (default: "1000")
+#   HOT_BUFFER_MAX_SIZE    - Max vectors in hot buffer (default: "10000")
+#
+# Ingest service tuning:
+#   COMPACTION_INTERVAL    - How often to compact WAL (default: "5m")
+#   QUANTIZATION           - none | f16 | sq8 (default: "sq8")
+#   IVF_ENABLED            - Enable IVF clustering (default: "true")
+#   IVF_MIN_SEGMENT_SIZE   - Min vectors for IVF (default: "10000")
+#   HNSW_M                 - HNSW graph connectivity (default: "16")
+#   HNSW_EF_CONSTRUCTION   - HNSW build quality (default: "200")
+#
+# Full-text search:
+#   TEXT_INDEX_ENABLED     - Build BM25 text indexes (default: "true")
+#   TEXT_ENABLE_STEMMING   - Enable Porter stemming (default: "true")
+#   TEXT_LANGUAGE          - Stemming language (default: "english")
+#   BM25_K1                - BM25 term saturation (default: "1.2")
+#   BM25_B                 - BM25 length normalization (default: "0.75")
+#   RRF_K                  - Reciprocal Rank Fusion constant (default: "60")
+#
+# =============================================================================
+# Performance Tips
+# =============================================================================
+#
+#   - Attach a volume to /data for segment caching (faster queries)
+#   - Increase HNSW_EF_SEARCH for better recall (slower queries)
+#   - Increase HOT_BUFFER_MAX_SIZE for high write throughput
+#   - Use quantization (sq8) for 4x memory savings with ~1% recall loss
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30
