@@ -211,7 +211,7 @@ impl BackgroundSync {
 
             // Update Merkle state
             if let Some(hash) = &seg.content_hash {
-                merkle_state.add_segment(&seg.id, hash);
+                merkle_state.add_segment(&seg.id, hash, seg.size_bytes);
             }
 
             segments_synced += 1;

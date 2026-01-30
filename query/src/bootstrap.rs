@@ -52,11 +52,18 @@ pub struct Phase1Stats {
     pub bytes_downloaded: u64,
 }
 
+/// Info about a locally cached segment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalSegmentInfo {
+    pub content_hash: String,
+    pub size_bytes: u64,
+}
+
 /// Local Merkle state: tracks which segments are locally present.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LocalMerkleState {
-    /// Map of segment_id -> content_hash for locally present segments.
-    pub segments: HashMap<String, String>,
+    /// Map of segment_id -> segment info for locally present segments.
+    pub segments: HashMap<String, LocalSegmentInfo>,
 }
 
 impl LocalMerkleState {
@@ -77,14 +84,22 @@ impl LocalMerkleState {
 
     pub fn has_segment(&self, segment_id: &str, content_hash: &Option<String>) -> bool {
         match (self.segments.get(segment_id), content_hash) {
-            (Some(local_hash), Some(remote_hash)) => local_hash == remote_hash,
+            (Some(info), Some(remote_hash)) => &info.content_hash == remote_hash,
             (Some(_), None) => true, // No remote hash to compare, assume valid
             (None, _) => false,
         }
     }
 
-    pub fn add_segment(&mut self, segment_id: &str, content_hash: &str) {
-        self.segments.insert(segment_id.to_string(), content_hash.to_string());
+    pub fn add_segment(&mut self, segment_id: &str, content_hash: &str, size_bytes: u64) {
+        self.segments.insert(segment_id.to_string(), LocalSegmentInfo {
+            content_hash: content_hash.to_string(),
+            size_bytes,
+        });
+    }
+    
+    /// Get total size of all locally cached segments.
+    pub fn total_size_bytes(&self) -> u64 {
+        self.segments.values().map(|info| info.size_bytes).sum()
     }
 
     pub fn remove_segment(&mut self, segment_id: &str) {
@@ -377,7 +392,7 @@ impl Rehydrator {
         // Update local Merkle state
         if let Some(hash) = &seg.content_hash {
             let mut state = self.merkle_state.write().await;
-            state.add_segment(&seg.id, hash);
+            state.add_segment(&seg.id, hash, seg.size_bytes);
             let _ = state.save(self.local_dir.to_str().unwrap_or("/data"));
         }
 

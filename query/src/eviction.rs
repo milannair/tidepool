@@ -92,23 +92,11 @@ impl Evictor {
         Arc::clone(&self.access_tracker)
     }
 
-    /// Calculate current local disk usage.
+    /// Calculate current local disk usage from tracked segment sizes.
     pub async fn disk_usage(&self) -> u64 {
-        let local = LocalStore::new(&self.local_dir);
-        
-        // List all files and sum their sizes
-        let keys = match local.list("").await {
-            Ok(keys) => keys,
-            Err(_) => return 0,
-        };
-
-        let mut total: u64 = 0;
-        for key in keys {
-            if let Ok(meta) = local.head(&key).await {
-                total += meta.size;
-            }
-        }
-        total
+        // Use LocalMerkleState for accurate segment size tracking
+        let merkle_state = LocalMerkleState::load(self.local_dir.to_str().unwrap_or("/data"));
+        merkle_state.total_size_bytes()
     }
 
     /// Check if eviction is needed.
