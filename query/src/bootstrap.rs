@@ -221,8 +221,8 @@ impl Bootstrap {
             })
             .collect();
 
-        // Sort by priority (highest first)
-        to_download.sort_by(|a, b| b.priority.cmp(&a.priority));
+        // Sort by priority (lowest first, so pop() returns highest priority)
+        to_download.sort_by(|a, b| a.priority.cmp(&b.priority));
 
         let stats = Phase1Stats {
             duration: start.elapsed(),
@@ -343,7 +343,7 @@ impl Rehydrator {
                 let mut retry_info = info;
                 retry_info.priority -= 1000; // Lower priority for retry
                 queue.push(retry_info);
-                queue.sort_by(|a, b| b.priority.cmp(&a.priority));
+                queue.sort_by(|a, b| a.priority.cmp(&b.priority));
             }
         }
     }
@@ -399,7 +399,7 @@ impl Rehydrator {
     pub async fn enqueue(&self, segments: Vec<SegmentDownloadInfo>) {
         let mut queue = self.queue.write().await;
         queue.extend(segments);
-        queue.sort_by(|a, b| b.priority.cmp(&a.priority));
+        queue.sort_by(|a, b| a.priority.cmp(&b.priority));
     }
 
     /// Check if a segment is locally present.
