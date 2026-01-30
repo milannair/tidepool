@@ -68,14 +68,6 @@
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
-watchPatterns = [
-  "query/src/**",
-  "ingest/src/**",
-  "crates/**",
-  "Cargo.toml",
-  "Cargo.lock",
-  "Dockerfile"
-]
 
 [deploy]
 restartPolicyType = "on_failure"
