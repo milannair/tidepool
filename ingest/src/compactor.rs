@@ -118,6 +118,9 @@ impl<S: Store + Clone> Compactor<S> {
                 segment_key: seg.segment_key.clone(),
                 doc_count: seg.doc_count,
                 dimensions: seg.dimensions,
+                size_bytes: seg.size_bytes,
+                content_hash: Some(seg.content_hash.clone()),
+                bloom_key: Some(seg.bloom_key.clone()),
             });
         } else {
             info!("No vectors to compact, applying tombstones only");
@@ -136,7 +139,13 @@ impl<S: Store + Clone> Compactor<S> {
             tombstones.remove(&doc.id);
         }
 
-        let mut new_manifest = Manifest::new(segments);
+        // Increment generation from previous manifest (or start at 1)
+        let prev_generation = if let Ok(manifest) = self.manifest_manager.load().await {
+            manifest.generation
+        } else {
+            0
+        };
+        let mut new_manifest = Manifest::new_with_generation(segments, prev_generation + 1);
         if new_manifest.dimensions == 0 {
             new_manifest.dimensions = dims;
         }

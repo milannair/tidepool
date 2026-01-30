@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -12,13 +14,17 @@ use tracing::{error, info};
 
 use tidepool_common::config::Config;
 use tidepool_common::document::QueryRequest;
-use tidepool_common::storage::S3Store;
+use tidepool_common::storage::{LocalStore, S3Store};
+use tidepool_query::bootstrap::{Bootstrap, Rehydrator};
 use tidepool_query::engine::EngineOptions;
+use tidepool_query::eviction::Evictor;
+use tidepool_query::loader::DataLoader;
 use tidepool_query::namespace_manager::{NamespaceError, NamespaceManager};
+use tidepool_query::sync::BackgroundSync;
 
 #[derive(Clone)]
 struct AppState {
-    namespaces: Arc<NamespaceManager<S3Store>>,
+    namespaces: Arc<NamespaceManager<LocalStore>>,
     max_top_k: usize,
 }
 
@@ -28,7 +34,7 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    info!("Starting tidepool-query service...");
+    info!("Starting tidepool-query service (local-first)...");
 
     let cfg = match Config::from_env() {
         Ok(cfg) => cfg,
@@ -38,31 +44,88 @@ async fn main() {
         }
     };
 
-    let storage = match S3Store::new(&cfg).await {
+    let s3_store = match S3Store::new(&cfg).await {
         Ok(store) => store,
         Err(err) => {
-            error!("Failed to initialize storage client: {}", err);
+            error!("Failed to initialize S3 client: {}", err);
             std::process::exit(1);
         }
     };
 
+    // Two-phase startup: Phase 1 loads manifests + Bloom filters only (fast)
+    // Phase 2 rehydrates segment data in background
+    if cfg.eager_sync_all {
+        // Legacy mode: download everything at startup (blocking)
+        info!("EAGER_SYNC_ALL=true: downloading all data at startup...");
+        let loader = DataLoader::new(s3_store.clone(), PathBuf::from(&cfg.data_dir));
+        match loader.sync_all().await {
+            Ok(stats) => info!(
+                "Synced {} bytes ({} namespaces, {} segments) in {:?}",
+                stats.bytes_synced,
+                stats.namespaces,
+                stats.segments,
+                stats.duration
+            ),
+            Err(err) => {
+                error!("Initial sync failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Cold-start-safe mode: two-phase bootstrap
+        info!("Phase 1: Loading manifests and Bloom filters...");
+        let bootstrap = Bootstrap::new(
+            s3_store.clone(),
+            PathBuf::from(&cfg.data_dir),
+            cfg.max_local_disk,
+            cfg.target_local_disk,
+            cfg.eager_sync_all,
+        );
+        
+        let bootstrap_state = match bootstrap.phase1().await {
+            Ok(state) => state,
+            Err(err) => {
+                error!("Phase 1 bootstrap failed: {}", err);
+                std::process::exit(1);
+            }
+        };
+
+        info!(
+            "Phase 1 complete: {} namespaces, {} Bloom filters loaded, {} segments to download",
+            bootstrap_state.stats.namespaces,
+            bootstrap_state.stats.blooms_loaded,
+            bootstrap_state.to_download.len()
+        );
+
+        // Start Phase 2 (background rehydration) if there are segments to download
+        if !bootstrap_state.to_download.is_empty() {
+            info!("Phase 2: Starting background rehydration ({} segments)...", bootstrap_state.to_download.len());
+            let rehydrator = Rehydrator::new(
+                s3_store.clone(),
+                PathBuf::from(&cfg.data_dir),
+                cfg.max_local_disk,
+                bootstrap_state.to_download,
+            );
+            tokio::spawn(async move {
+                rehydrator.run().await;
+            });
+        }
+    }
+
+    let local_store = LocalStore::new(&cfg.data_dir);
+
     if cfg.hot_buffer_max_size > 0 {
         info!(
-            "Real-time updates enabled via WAL scanning (buffer size per namespace: {})",
+            "Hot buffer enabled (buffer size per namespace: {})",
             cfg.hot_buffer_max_size
         );
     } else {
-        info!("Real-time updates disabled (HOT_BUFFER_MAX_SIZE=0)");
+        info!("Hot buffer disabled (HOT_BUFFER_MAX_SIZE=0)");
     }
 
-    info!(
-        "State refresh interval: {}ms (REFRESH_INTERVAL_MS)",
-        cfg.refresh_interval_ms
-    );
-
     let namespaces = NamespaceManager::new(
-        storage,
-        Some(cfg.cache_dir.clone()),
+        local_store,
+        Some(cfg.data_dir.clone()),
         EngineOptions {
             hnsw_ef_search: cfg.hnsw_ef_search,
             quantization_rerank_factor: cfg.quantization_rerank_factor,
@@ -70,8 +133,6 @@ async fn main() {
             bm25_b: cfg.bm25_b,
             rrf_k: cfg.rrf_k,
             tokenizer_config: cfg.tokenizer_config(),
-            refresh_interval_ms: cfg.refresh_interval_ms,
-            wal_list_interval_ms: cfg.wal_list_interval_ms,
         },
         cfg.hot_buffer_max_size,
         cfg.allowed_namespaces.clone(),
@@ -79,9 +140,27 @@ async fn main() {
         cfg.namespace_idle_timeout,
         cfg.namespace.clone(),
     );
+    let namespaces = Arc::new(namespaces);
+
+    let sync = BackgroundSync::new(
+        s3_store,
+        PathBuf::from(&cfg.data_dir),
+        namespaces.clone(),
+        cfg.sync_interval,
+    )
+    .with_eager_sync(cfg.eager_sync_all);
+    tokio::spawn(sync.run());
+
+    // Start background eviction (checks every 60 seconds)
+    let evictor = Evictor::new(
+        PathBuf::from(&cfg.data_dir),
+        cfg.max_local_disk,
+        cfg.target_local_disk,
+    );
+    tokio::spawn(evictor.run(Duration::from_secs(60)));
 
     let state = AppState {
-        namespaces: Arc::new(namespaces),
+        namespaces,
         max_top_k: cfg.max_top_k,
     };
 

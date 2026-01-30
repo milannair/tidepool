@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -104,6 +105,129 @@ fn simple_hash(data: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write(data);
     hasher.finish()
+}
+
+/// Local filesystem store. Keys are path components (e.g. "namespaces/default/segments/abc.tpvs").
+#[derive(Clone)]
+pub struct LocalStore {
+    root_dir: PathBuf,
+}
+
+impl LocalStore {
+    pub fn new(root_dir: impl AsRef<Path>) -> Self {
+        Self {
+            root_dir: root_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    fn key_to_path(&self, key: &str) -> PathBuf {
+        self.root_dir.join(key)
+    }
+
+    /// List keys under prefix by walking the directory. Returns keys as relative paths from root_dir.
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let root = self.root_dir.clone();
+        let base = self.key_to_path(prefix);
+        let keys = tokio::task::spawn_blocking(move || {
+            let mut keys = Vec::new();
+            if !base.is_dir() {
+                return keys;
+            }
+            let mut stack = vec![base];
+            while let Some(current) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&current) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.is_file() {
+                        if let Ok(relative) = path.strip_prefix(&root) {
+                            if let Some(key) = relative.to_str() {
+                                keys.push(key.replace('\\', "/"));
+                            }
+                        }
+                    }
+                }
+            }
+            keys
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("list_dir: {}", e)))?;
+        Ok(keys)
+    }
+}
+
+#[async_trait]
+impl Store for LocalStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        let path = self.key_to_path(key);
+        tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(key.to_string())
+            } else {
+                StorageError::Other(format!("read {}: {}", key, e))
+            }
+        })
+    }
+
+    async fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
+        let path = self.key_to_path(key);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Other(format!("create_dir_all {}: {}", key, e)))?;
+        }
+        tokio::fs::write(&path, data)
+            .await
+            .map_err(|e| StorageError::Other(format!("write {}: {}", key, e)))?;
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        let path = self.key_to_path(key);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound(key.to_string()))
+            }
+            Err(e) => Err(StorageError::Other(format!("delete {}: {}", key, e))),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        self.list_prefix(prefix).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, StorageError> {
+        let path = self.key_to_path(key);
+        Ok(path.is_file())
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+        let path = self.key_to_path(key);
+        let meta = tokio::fs::metadata(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(key.to_string())
+            } else {
+                StorageError::Other(format!("metadata {}: {}", key, e))
+            }
+        })?;
+        if !meta.is_file() {
+            return Err(StorageError::NotFound(key.to_string()));
+        }
+        let last_modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        Ok(ObjectMeta {
+            etag: None,
+            last_modified,
+            size: meta.len(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -289,6 +413,19 @@ pub fn segment_text_index_path(namespace: &str, segment_id: &str) -> String {
     namespace_path(namespace, &format!("segments/{}.tpti", segment_id))
 }
 
+pub fn segment_bloom_path(namespace: &str, segment_id: &str) -> String {
+    namespace_path(namespace, &format!("segments/{}.bloom", segment_id))
+}
+
+pub fn segment_meta_path(namespace: &str, segment_id: &str) -> String {
+    namespace_path(namespace, &format!("segments/{}.meta", segment_id))
+}
+
 pub fn tombstone_path(namespace: &str) -> String {
     namespace_path(namespace, "tombstones/latest.rkyv")
+}
+
+/// Path for local Merkle state (tracks which segments are present locally).
+pub fn local_merkle_path(data_dir: &str) -> String {
+    format!("{}/local_merkle.json", data_dir)
 }

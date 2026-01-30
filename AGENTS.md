@@ -260,12 +260,21 @@ docker system prune -f  # Clean up unused images
 ## Running Benchmarks
 
 ```bash
-# HNSW benchmark
-cargo bench -p tidepool-common --bench hnsw
+# HTTP API benchmarks (local Docker)
+make bench-local
 
-# SIMD benchmark
+# HTTP API benchmarks (production)
+make bench INGEST_URL=https://... QUERY_URL=https://...
+
+# Rust-level benchmarks (HNSW, SIMD)
+make bench-rust
+
+# Or directly:
+cargo bench -p tidepool-common --bench hnsw
 cargo bench -p tidepool-common --bench simd
 ```
+
+See `docs/PERFORMANCE.md` for detailed benchmark results.
 
 ## Code Organization
 

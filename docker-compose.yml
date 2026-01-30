@@ -42,9 +42,11 @@ services:
       AWS_REGION: us-east-1
       BUCKET_NAME: tidepool
       CACHE_DIR: /data
+      DATA_DIR: /data
       # NAMESPACE: default  # Removed to enable dynamic namespaces
       MAX_NAMESPACES: 100
       HOT_BUFFER_MAX_SIZE: 10000
+      EAGER_SYNC_ALL: "true"
       RUST_LOG: info
     volumes:
       - query-cache:/data
