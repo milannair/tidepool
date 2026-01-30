@@ -23,6 +23,7 @@ pub struct BufferedWalWriter<S: Store + Clone + Send + Sync + 'static> {
 }
 
 impl<S: Store + Clone + Send + Sync + 'static> BufferedWalWriter<S> {
+    #[allow(dead_code)]
     pub fn new(writer: WalWriter<S>, max_entries: usize, flush_interval: Duration) -> Self {
         Self::new_with_redis(writer, max_entries, flush_interval, None, "".to_string())
     }

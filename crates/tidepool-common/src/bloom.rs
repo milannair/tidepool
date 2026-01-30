@@ -107,14 +107,11 @@ impl BloomFilter {
         if data.is_empty() {
             return None;
         }
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.is_empty() {
-            return None;
-        }
         rkyv::check_archived_root::<BloomFilter>(data)
             .ok()?
             .deserialize(&mut rkyv::Infallible)
             .ok()
+    }
 
     fn hash_pair<T: Hash>(&self, item: &T) -> (u64, u64) {
         // Use two different hash functions based on FNV-1a

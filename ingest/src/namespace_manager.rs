@@ -50,6 +50,7 @@ pub struct NamespaceManager<S: Store + Clone + Send + Sync + 'static> {
 
 impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn new(
         storage: S,
         writer_options: WriterOptions,

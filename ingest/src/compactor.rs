@@ -25,6 +25,7 @@ pub struct Compactor<S: Store + Clone> {
 }
 
 impl<S: Store + Clone> Compactor<S> {
+    #[allow(dead_code)]
     pub fn new_with_options(storage: S, namespace: impl Into<String>, opts: WriterOptions) -> Self {
         Self::new_with_redis(storage, namespace, opts, None)
     }

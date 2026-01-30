@@ -319,10 +319,7 @@ impl Rehydrator {
     /// Get current local disk usage.
     async fn local_disk_usage(&self) -> u64 {
         let state = self.merkle_state.read().await;
-        // Sum up sizes from segments we have
-        // For now, just count number of segments * estimated size
-        // TODO: Track actual sizes in merkle state
-        (state.segments.len() * 10_000_000) as u64 // Rough estimate
+        state.total_size_bytes()
     }
 
     /// Run the rehydration loop. Never returns.
