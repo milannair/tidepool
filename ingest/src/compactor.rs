@@ -128,8 +128,9 @@ impl<S: Store + Clone> Compactor<S> {
             );
 
             // ManifestSegment guarantees these are populated by write_segment()
-            debug_assert!(!seg.content_hash.is_empty(), "content_hash must be set");
-            debug_assert!(!seg.bloom_key.is_empty(), "bloom_key must be set");
+            if seg.content_hash.is_empty() || seg.bloom_key.is_empty() {
+                return Err(format!("segment {} missing content_hash or bloom_key", seg.id));
+            }
 
             segments.push(tidepool_common::manifest::Segment {
                 id: seg.id.clone(),
