@@ -31,7 +31,8 @@ services:
   tidepool-query:
     build:
       context: .
-      dockerfile: query/Dockerfile
+      dockerfile: Dockerfile
+    command: ["/tidepool-query"]
     ports:
       - "8080:8080"
     environment:
@@ -54,7 +55,8 @@ services:
   tidepool-ingest:
     build:
       context: .
-      dockerfile: ingest/Dockerfile
+      dockerfile: Dockerfile
+    command: ["/tidepool-ingest"]
     ports:
       - "8081:8080"
     environment:
