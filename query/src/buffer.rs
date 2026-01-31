@@ -117,7 +117,7 @@ impl AttributeIndex {
     }
 
     /// Get candidate document IDs matching the filter
-    /// Returns None if no index can be used (fall back to post-filter)
+    /// Returns None if any filter key is unindexed (fall back to post-filter)
     fn get_candidates(&self, filters: &AttrValue) -> Option<RoaringBitmap> {
         let AttrValue::Object(filter_map) = filters else { return None };
         
@@ -125,8 +125,9 @@ impl AttributeIndex {
         
         for (key, filter_val) in filter_map {
             let Some(key_index) = self.indexes.get(key) else {
-                // No index for this key, can't use pre-filtering
-                continue;
+                // No index for this key - must fall back to post-filtering
+                // to ensure all filter conditions are applied
+                return None;
             };
             
             let candidates = match filter_val {

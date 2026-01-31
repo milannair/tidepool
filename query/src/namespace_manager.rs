@@ -308,13 +308,13 @@ fn evict_lru<S: Store + Clone + Send + Sync + 'static>(
         .iter()
         .min_by_key(|(_, entry)| entry.last_access)
         .map(|(name, _)| name.clone())?;
-    guard.remove(&lru_name).map(|entry| {
-        // Abort the invalidation task when evicting
-        if let Some(task) = entry.invalidation_task {
-            task.abort();
-        }
-        entry.engine
-    })
+    
+    let entry = guard.remove(&lru_name)?;
+    // Abort invalidation listener task to prevent leak
+    if let Some(task) = entry.invalidation_task {
+        task.abort();
+    }
+    Some(entry.engine)
 }
 
 fn parse_namespace_from_key(key: &str) -> Option<&str> {

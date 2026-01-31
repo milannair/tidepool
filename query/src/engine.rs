@@ -667,12 +667,23 @@ impl<S: Store + Clone + 'static> Engine<S> {
             hasher.update(json.as_bytes());
         }
         
-        // Hash other params
+        // Hash search params
         hasher.update(req.ef_search.to_le_bytes());
         hasher.update(req.nprobe.to_le_bytes());
         
         if let Some(metric) = &req.distance_metric {
             hasher.update(metric.as_bytes());
+        }
+        
+        // Hash fusion/scoring params
+        if let Some(alpha) = req.alpha {
+            hasher.update(alpha.to_le_bytes());
+        }
+        if let Some(fusion) = &req.fusion {
+            hasher.update(fusion.as_bytes());
+        }
+        if let Some(rrf_k) = req.rrf_k {
+            hasher.update(rrf_k.to_le_bytes());
         }
         
         let result = hasher.finalize();

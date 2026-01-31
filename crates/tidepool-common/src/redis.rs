@@ -547,23 +547,35 @@ impl RedisStore {
         let pattern = format!("{}:cache:{}:*", self.keys.prefix, namespace);
         let mut conn = self.conn.clone();
         
-        // SCAN for keys matching pattern, then DEL
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(&pattern)
-            .query_async(&mut conn)
-            .await?;
+        // Use SCAN instead of KEYS to avoid blocking
+        let mut cursor = 0u64;
+        let mut total_deleted = 0u64;
         
-        if keys.is_empty() {
-            return Ok(0);
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await?;
+            
+            if !keys.is_empty() {
+                for key in keys {
+                    let _: () = conn.del(&key).await?;
+                    total_deleted += 1;
+                }
+            }
+            
+            cursor = new_cursor;
+            if cursor == 0 {
+                break;
+            }
         }
         
-        let count = keys.len() as u64;
-        for key in keys {
-            let _: () = conn.del(&key).await?;
-        }
-        
-        info!("Invalidated {} cached queries for namespace {}", count, namespace);
-        Ok(count)
+        info!("Invalidated {} cached queries for namespace {}", total_deleted, namespace);
+        Ok(total_deleted)
     }
 
     // ========== Pub/Sub for Cache Invalidation ==========
