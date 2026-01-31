@@ -11,7 +11,7 @@ use tidepool_common::segment::WriterOptions;
 use tidepool_common::storage::{Store, StorageError};
 use tidepool_common::wal::Writer as WalWriter;
 
-use crate::compactor::Compactor;
+use crate::compactor::{Compactor, CompactorOptions};
 use crate::wal_buffer::BufferedWalWriter;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,7 @@ pub struct NamespaceManager<S: Store + Clone + Send + Sync + 'static> {
     allowed_namespaces: Option<HashSet<String>>,
     fixed_namespace: Option<String>,
     redis: Option<Arc<RedisStore>>,
+    compactor_options: CompactorOptions,
     namespaces: RwLock<HashMap<String, NamespaceEntry<S>>>,
 }
 
@@ -73,6 +74,7 @@ impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
             idle_timeout,
             fixed_namespace,
             None,
+            CompactorOptions::default(),
         )
     }
 
@@ -88,6 +90,7 @@ impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
         idle_timeout: Option<Duration>,
         fixed_namespace: Option<String>,
         redis: Option<Arc<RedisStore>>,
+        compactor_options: CompactorOptions,
     ) -> Self {
         let allowed_namespaces = match fixed_namespace.as_ref() {
             Some(ns) => Some([ns.clone()].into_iter().collect()),
@@ -105,6 +108,7 @@ impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
             allowed_namespaces,
             fixed_namespace,
             redis,
+            compactor_options,
             namespaces: RwLock::new(HashMap::new()),
         }
     }
@@ -148,6 +152,7 @@ impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
                 namespace.to_string(),
                 self.writer_options.clone(),
                 self.redis.clone(),
+                self.compactor_options.clone(),
             ));
 
             let compactor_task = {

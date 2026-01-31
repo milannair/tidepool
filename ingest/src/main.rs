@@ -18,6 +18,7 @@ use tidepool_common::segment::WriterOptions;
 use tidepool_common::storage::S3Store;
 
 mod compactor;
+use compactor::CompactorOptions;
 mod namespace_manager;
 use namespace_manager::{NamespaceError, NamespaceManager};
 mod wal_buffer;
@@ -86,6 +87,13 @@ async fn main() {
         ..WriterOptions::default()
     };
 
+    // Configure compactor options based on Redis availability
+    let compactor_options = CompactorOptions {
+        use_distributed_lock: cfg.redis_compaction_lock_enabled && cfg.redis_url.is_some(),
+        lock_ttl_secs: cfg.redis_compaction_lock_ttl_secs,
+        use_pubsub_invalidation: cfg.redis_pubsub_enabled && cfg.redis_url.is_some(),
+    };
+
     let namespaces = Arc::new(NamespaceManager::new_with_redis(
         storage,
         writer_options,
@@ -97,6 +105,7 @@ async fn main() {
         cfg.namespace_idle_timeout,
         cfg.namespace.clone(),
         redis,
+        compactor_options,
     ));
 
     let state = AppState {

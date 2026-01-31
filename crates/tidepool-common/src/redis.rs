@@ -107,6 +107,7 @@ pub struct StreamEntry {
 pub struct RedisStore {
     conn: ConnectionManager,
     keys: Arc<RedisKeys>,
+    url: String,
     #[allow(dead_code)]
     wal_ttl_secs: u64,
 }
@@ -122,6 +123,7 @@ impl RedisStore {
         Ok(Self {
             conn,
             keys: Arc::new(RedisKeys::new(prefix)),
+            url: url.to_string(),
             wal_ttl_secs,
         })
     }
@@ -356,6 +358,676 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let members: Vec<String> = conn.smembers(&key).await?;
         Ok(members)
+    }
+}
+
+// ============================================================================
+// DISTRIBUTED LOCKING
+// ============================================================================
+
+/// Distributed lock for coordinating operations across instances
+pub struct DistributedLock {
+    conn: ConnectionManager,
+    key: String,
+    token: String,
+    ttl_secs: u64,
+}
+
+impl DistributedLock {
+    /// Release the lock
+    pub async fn release(self) -> Result<bool, RedisError> {
+        let mut conn = self.conn;
+        
+        // Use Lua script for atomic check-and-delete
+        let script = r#"
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        "#;
+        
+        let result: i32 = redis::Script::new(script)
+            .key(&self.key)
+            .arg(&self.token)
+            .invoke_async(&mut conn)
+            .await?;
+        
+        Ok(result == 1)
+    }
+    
+    /// Extend the lock TTL
+    pub async fn extend(&mut self, extra_secs: u64) -> Result<bool, RedisError> {
+        let script = r#"
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("expire", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+        "#;
+        
+        let new_ttl = self.ttl_secs + extra_secs;
+        let result: i32 = redis::Script::new(script)
+            .key(&self.key)
+            .arg(&self.token)
+            .arg(new_ttl)
+            .invoke_async(&mut self.conn)
+            .await?;
+        
+        if result == 1 {
+            self.ttl_secs = new_ttl;
+        }
+        
+        Ok(result == 1)
+    }
+}
+
+// ============================================================================
+// QUERY CACHE ENTRY
+// ============================================================================
+
+/// Cached query result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedQueryResult {
+    pub results_json: String,
+    pub created_at: i64,
+    pub namespace: String,
+}
+
+impl RedisStore {
+    // ========== Distributed Locking ==========
+
+    /// Try to acquire a distributed lock
+    /// Returns Some(lock) if acquired, None if lock is held by another instance
+    pub async fn try_lock(
+        &self,
+        name: &str,
+        ttl_secs: u64,
+    ) -> Result<Option<DistributedLock>, RedisError> {
+        let key = format!("{}:lock:{}", self.keys.prefix, name);
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut conn = self.conn.clone();
+        
+        // SET key value NX EX ttl
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&token)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await?;
+        
+        if result.is_some() {
+            info!("Acquired lock: {} (token: {})", name, &token[..8]);
+            Ok(Some(DistributedLock {
+                conn: self.conn.clone(),
+                key,
+                token,
+                ttl_secs,
+            }))
+        } else {
+            debug!("Failed to acquire lock: {} (already held)", name);
+            Ok(None)
+        }
+    }
+    
+    /// Acquire a lock with retry
+    pub async fn lock_with_retry(
+        &self,
+        name: &str,
+        ttl_secs: u64,
+        max_retries: usize,
+        retry_delay_ms: u64,
+    ) -> Result<Option<DistributedLock>, RedisError> {
+        for attempt in 0..max_retries {
+            if let Some(lock) = self.try_lock(name, ttl_secs).await? {
+                return Ok(Some(lock));
+            }
+            if attempt < max_retries - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+            }
+        }
+        Ok(None)
+    }
+
+    // ========== Query Result Caching ==========
+    
+    /// Cache a query result
+    pub async fn cache_query(
+        &self,
+        namespace: &str,
+        query_hash: &str,
+        results_json: &str,
+        ttl_secs: u64,
+    ) -> Result<(), RedisError> {
+        let key = format!("{}:cache:{}:{}", self.keys.prefix, namespace, query_hash);
+        let mut conn = self.conn.clone();
+        
+        let entry = CachedQueryResult {
+            results_json: results_json.to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+            namespace: namespace.to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap_or_default();
+        
+        conn.set_ex::<_, _, ()>(&key, &json, ttl_secs).await?;
+        debug!("Cached query result: {} (TTL: {}s)", query_hash, ttl_secs);
+        
+        Ok(())
+    }
+    
+    /// Get a cached query result
+    pub async fn get_cached_query(
+        &self,
+        namespace: &str,
+        query_hash: &str,
+    ) -> Result<Option<CachedQueryResult>, RedisError> {
+        let key = format!("{}:cache:{}:{}", self.keys.prefix, namespace, query_hash);
+        let mut conn = self.conn.clone();
+        
+        let result: Option<String> = conn.get(&key).await?;
+        
+        match result {
+            Some(json) => {
+                match serde_json::from_str(&json) {
+                    Ok(entry) => {
+                        debug!("Cache hit: {}", query_hash);
+                        Ok(Some(entry))
+                    }
+                    Err(_) => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Invalidate all cached queries for a namespace
+    pub async fn invalidate_query_cache(&self, namespace: &str) -> Result<u64, RedisError> {
+        let pattern = format!("{}:cache:{}:*", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        // Use SCAN instead of KEYS to avoid blocking
+        let mut cursor = 0u64;
+        let mut total_deleted = 0u64;
+        
+        loop {
+            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await?;
+            
+            if !keys.is_empty() {
+                for key in keys {
+                    let _: () = conn.del(&key).await?;
+                    total_deleted += 1;
+                }
+            }
+            
+            cursor = new_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        
+        info!("Invalidated {} cached queries for namespace {}", total_deleted, namespace);
+        Ok(total_deleted)
+    }
+
+    // ========== Pub/Sub for Cache Invalidation ==========
+    
+    /// Publish a cache invalidation event
+    pub async fn publish_invalidation(
+        &self,
+        namespace: &str,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<u64, RedisError> {
+        let channel = format!("{}:invalidate:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let message = serde_json::json!({
+            "type": event_type,
+            "namespace": namespace,
+            "payload": payload,
+            "timestamp": chrono::Utc::now().timestamp_millis()
+        });
+        
+        let subscribers: u64 = conn.publish(&channel, message.to_string()).await?;
+        debug!(
+            "Published invalidation event {} to {} ({} subscribers)",
+            event_type, channel, subscribers
+        );
+        
+        Ok(subscribers)
+    }
+    
+    /// Subscribe to invalidation events for a namespace
+    /// Returns a receiver that yields invalidation messages
+    pub async fn subscribe_invalidations(
+        &self,
+        namespace: &str,
+    ) -> Result<redis::aio::PubSub, RedisError> {
+        let channel = format!("{}:invalidate:{}", self.keys.prefix, namespace);
+        
+        // Create a new connection for pub/sub (can't reuse ConnectionManager)
+        let client = redis::Client::open(&*self.url)?;
+        let mut pubsub = client.get_async_pubsub().await?;
+        
+        pubsub.subscribe(&channel).await?;
+        info!("Subscribed to invalidation channel: {}", channel);
+        
+        Ok(pubsub)
+    }
+    
+    /// Subscribe to invalidation events for all namespaces (pattern subscribe)
+    pub async fn subscribe_all_invalidations(&self) -> Result<redis::aio::PubSub, RedisError> {
+        let pattern = format!("{}:invalidate:*", self.keys.prefix);
+        
+        let client = redis::Client::open(&*self.url)?;
+        let mut pubsub = client.get_async_pubsub().await?;
+        
+        pubsub.psubscribe(&pattern).await?;
+        info!("Subscribed to invalidation pattern: {}", pattern);
+        
+        Ok(pubsub)
+    }
+
+    // ========== Shared Hot Buffer (Vector Storage) ==========
+    
+    /// Store vectors in Redis for shared hot buffer
+    pub async fn store_hot_vectors(
+        &self,
+        namespace: &str,
+        vectors: &[(String, Vec<f32>, Option<String>)], // (id, vector, attributes_json)
+    ) -> Result<(), RedisError> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        
+        let key = format!("{}:hotvec:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        // Use HSET to store vectors as hash fields
+        for (id, vector, attrs) in vectors {
+            let vector_json = serde_json::to_string(vector).unwrap_or_default();
+            let value = serde_json::json!({
+                "vector": vector_json,
+                "attributes": attrs,
+            });
+            let _: () = conn.hset(&key, id, value.to_string()).await?;
+        }
+        
+        debug!("Stored {} hot vectors for namespace {}", vectors.len(), namespace);
+        Ok(())
+    }
+    
+    /// Get a hot vector by ID
+    pub async fn get_hot_vector(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<(Vec<f32>, Option<String>)>, RedisError> {
+        let key = format!("{}:hotvec:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let result: Option<String> = conn.hget(&key, id).await?;
+        
+        match result {
+            Some(json) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let vector: Vec<f32> = value.get("vector")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+                    let attrs = value.get("attributes")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    Ok(Some((vector, attrs)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Delete hot vectors by ID
+    pub async fn delete_hot_vectors(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<u64, RedisError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        
+        let key = format!("{}:hotvec:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let deleted: u64 = conn.hdel(&key, ids).await?;
+        debug!("Deleted {} hot vectors from namespace {}", deleted, namespace);
+        
+        Ok(deleted)
+    }
+    
+    /// Get count of hot vectors
+    pub async fn hot_vector_count(&self, namespace: &str) -> Result<u64, RedisError> {
+        let key = format!("{}:hotvec:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let count: u64 = conn.hlen(&key).await?;
+        Ok(count)
+    }
+    
+    /// Clear all hot vectors for a namespace (after compaction)
+    pub async fn clear_hot_vectors(&self, namespace: &str) -> Result<u64, RedisError> {
+        let key = format!("{}:hotvec:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let count: u64 = conn.hlen(&key).await?;
+        let _: () = conn.del(&key).await?;
+        
+        info!("Cleared {} hot vectors for namespace {}", count, namespace);
+        Ok(count)
+    }
+
+    // ========== Redis Vector Search (FT module) ==========
+    
+    /// Create a vector search index for a namespace.
+    /// Requires Redis Stack with RediSearch module.
+    pub async fn create_vector_index(
+        &self,
+        namespace: &str,
+        dimensions: usize,
+    ) -> Result<(), RedisError> {
+        let index_name = format!("{}:vecidx:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        // FT.CREATE idx ON HASH PREFIX 1 prefix: SCHEMA
+        //   vector VECTOR HNSW 6 TYPE FLOAT32 DIM dims DISTANCE_METRIC COSINE
+        //   id TEXT
+        //   attrs TEXT
+        let result: Result<String, _> = redis::cmd("FT.CREATE")
+            .arg(&index_name)
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg(format!("{}:vec:{}:", self.keys.prefix, namespace))
+            .arg("SCHEMA")
+            .arg("vector")
+            .arg("VECTOR")
+            .arg("HNSW")
+            .arg("6")
+            .arg("TYPE")
+            .arg("FLOAT32")
+            .arg("DIM")
+            .arg(dimensions)
+            .arg("DISTANCE_METRIC")
+            .arg("COSINE")
+            .arg("id")
+            .arg("TEXT")
+            .arg("attrs")
+            .arg("TEXT")
+            .query_async(&mut conn)
+            .await;
+        
+        match result {
+            Ok(_) => {
+                info!("Created vector index {} with {} dimensions", index_name, dimensions);
+                Ok(())
+            }
+            Err(e) => {
+                // Index might already exist
+                if e.to_string().contains("Index already exists") {
+                    debug!("Vector index {} already exists", index_name);
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+    
+    /// Drop a vector search index.
+    pub async fn drop_vector_index(&self, namespace: &str) -> Result<(), RedisError> {
+        let index_name = format!("{}:vecidx:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        let _: Result<String, _> = redis::cmd("FT.DROPINDEX")
+            .arg(&index_name)
+            .arg("DD") // Delete documents too
+            .query_async(&mut conn)
+            .await;
+        
+        info!("Dropped vector index {}", index_name);
+        Ok(())
+    }
+    
+    /// Add vectors to the search index.
+    pub async fn index_vectors(
+        &self,
+        namespace: &str,
+        vectors: &[(String, Vec<f32>, Option<String>)], // (id, vector, attributes_json)
+    ) -> Result<(), RedisError> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        
+        let mut conn = self.conn.clone();
+        let prefix = format!("{}:vec:{}:", self.keys.prefix, namespace);
+        
+        for (id, vector, attrs) in vectors {
+            let key = format!("{}{}", prefix, id);
+            
+            // Convert vector to bytes (little-endian f32)
+            let vector_bytes: Vec<u8> = vector
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            
+            // HSET key id value vector bytes attrs json
+            let _: () = redis::cmd("HSET")
+                .arg(&key)
+                .arg("id")
+                .arg(id)
+                .arg("vector")
+                .arg(&vector_bytes)
+                .arg("attrs")
+                .arg(attrs.as_deref().unwrap_or("{}"))
+                .query_async(&mut conn)
+                .await?;
+        }
+        
+        debug!("Indexed {} vectors for namespace {}", vectors.len(), namespace);
+        Ok(())
+    }
+    
+    /// Remove vectors from the search index.
+    pub async fn unindex_vectors(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<u64, RedisError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        
+        let mut conn = self.conn.clone();
+        let prefix = format!("{}:vec:{}:", self.keys.prefix, namespace);
+        let mut deleted = 0u64;
+        
+        for id in ids {
+            let key = format!("{}{}", prefix, id);
+            let result: u64 = conn.del(&key).await?;
+            deleted += result;
+        }
+        
+        debug!("Unindexed {} vectors from namespace {}", deleted, namespace);
+        Ok(deleted)
+    }
+    
+    /// Search vectors using Redis Vector Search.
+    /// Returns (id, score, attributes_json) tuples.
+    pub async fn search_vectors(
+        &self,
+        namespace: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: Option<&str>, // Optional FT.SEARCH filter expression
+    ) -> Result<Vec<(String, f32, Option<String>)>, RedisError> {
+        let index_name = format!("{}:vecidx:{}", self.keys.prefix, namespace);
+        let mut conn = self.conn.clone();
+        
+        // Convert query vector to bytes
+        let vector_bytes: Vec<u8> = query_vector
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        
+        // Build query string
+        let query = if let Some(f) = filter {
+            format!("({})=>[KNN {} @vector $BLOB AS score]", f, top_k)
+        } else {
+            format!("*=>[KNN {} @vector $BLOB AS score]", top_k)
+        };
+        
+        // FT.SEARCH idx query PARAMS 2 BLOB vector_bytes RETURN 3 id score attrs SORTBY score LIMIT 0 top_k DIALECT 2
+        let result: Vec<redis::Value> = redis::cmd("FT.SEARCH")
+            .arg(&index_name)
+            .arg(&query)
+            .arg("PARAMS")
+            .arg("2")
+            .arg("BLOB")
+            .arg(&vector_bytes)
+            .arg("RETURN")
+            .arg("3")
+            .arg("id")
+            .arg("score")
+            .arg("attrs")
+            .arg("SORTBY")
+            .arg("score")
+            .arg("LIMIT")
+            .arg("0")
+            .arg(top_k)
+            .arg("DIALECT")
+            .arg("2")
+            .query_async(&mut conn)
+            .await?;
+        
+        // Parse results
+        // Format: [total, key1, [field, value, field, value, ...], key2, [...], ...]
+        let mut results = Vec::new();
+        
+        if result.len() < 2 {
+            return Ok(results);
+        }
+        
+        let mut i = 1; // Skip total count
+        while i + 1 < result.len() {
+            // Skip key name
+            i += 1;
+            
+            if i >= result.len() {
+                break;
+            }
+            
+            // Parse field-value array
+            if let redis::Value::Array(fields) = &result[i] {
+                let mut id = String::new();
+                let mut score = 0.0f32;
+                let mut attrs = None;
+                
+                let mut j = 0;
+                while j + 1 < fields.len() {
+                    let field_name = match &fields[j] {
+                        redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+                        redis::Value::SimpleString(s) => s.clone(),
+                        _ => String::new(),
+                    };
+                    
+                    let field_value = &fields[j + 1];
+                    
+                    match field_name.as_str() {
+                        "id" => {
+                            id = match field_value {
+                                redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+                                redis::Value::SimpleString(s) => s.clone(),
+                                _ => String::new(),
+                            };
+                        }
+                        "score" => {
+                            score = match field_value {
+                                redis::Value::BulkString(b) => {
+                                    String::from_utf8_lossy(b).parse().unwrap_or(0.0)
+                                }
+                                redis::Value::SimpleString(s) => s.parse().unwrap_or(0.0),
+                                _ => 0.0,
+                            };
+                        }
+                        "attrs" => {
+                            attrs = match field_value {
+                                redis::Value::BulkString(b) => {
+                                    Some(String::from_utf8_lossy(b).to_string())
+                                }
+                                redis::Value::SimpleString(s) => Some(s.clone()),
+                                _ => None,
+                            };
+                        }
+                        _ => {}
+                    }
+                    
+                    j += 2;
+                }
+                
+                if !id.is_empty() {
+                    // Convert distance to similarity score (cosine: score = 1 - distance)
+                    let similarity = 1.0 - score;
+                    results.push((id, similarity, attrs));
+                }
+            }
+            
+            i += 1;
+        }
+        
+        debug!("Vector search returned {} results for namespace {}", results.len(), namespace);
+        Ok(results)
+    }
+    
+    /// Check if Redis Stack vector search is available.
+    pub async fn has_vector_search(&self) -> bool {
+        let mut conn = self.conn.clone();
+        
+        // Try to get module list
+        let result: Result<Vec<redis::Value>, _> = redis::cmd("MODULE")
+            .arg("LIST")
+            .query_async(&mut conn)
+            .await;
+        
+        match result {
+            Ok(modules) => {
+                // Check if 'search' or 'ReJSON' module is loaded
+                for module in modules {
+                    if let redis::Value::Array(arr) = module {
+                        for item in arr {
+                            if let redis::Value::BulkString(b) = item {
+                                let name = String::from_utf8_lossy(&b).to_lowercase();
+                                if name.contains("search") {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
     }
 }
 

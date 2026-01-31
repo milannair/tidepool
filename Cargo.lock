@@ -3316,10 +3316,15 @@ dependencies = [
 name = "tidepool-query"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
+ "futures-util",
+ "hex",
+ "parking_lot",
  "roaring",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tidepool-common",
  "tokio",

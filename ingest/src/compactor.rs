@@ -22,12 +22,36 @@ pub struct Compactor<S: Store + Clone> {
     tombstone_manager: TombstoneManager<S>,
     redis: Option<Arc<RedisStore>>,
     last_run: Arc<RwLock<Option<DateTime<Utc>>>>,
+    /// Enable distributed locking (default: true if Redis is available)
+    use_distributed_lock: bool,
+    /// Lock TTL in seconds
+    lock_ttl_secs: u64,
+    /// Enable pub/sub invalidation notifications
+    use_pubsub_invalidation: bool,
+}
+
+/// Options for compactor behavior
+#[derive(Clone)]
+pub struct CompactorOptions {
+    pub use_distributed_lock: bool,
+    pub lock_ttl_secs: u64,
+    pub use_pubsub_invalidation: bool,
+}
+
+impl Default for CompactorOptions {
+    fn default() -> Self {
+        Self {
+            use_distributed_lock: true,
+            lock_ttl_secs: 300, // 5 minutes
+            use_pubsub_invalidation: true,
+        }
+    }
 }
 
 impl<S: Store + Clone> Compactor<S> {
     #[allow(dead_code)]
     pub fn new_with_options(storage: S, namespace: impl Into<String>, opts: WriterOptions) -> Self {
-        Self::new_with_redis(storage, namespace, opts, None)
+        Self::new_with_redis(storage, namespace, opts, None, CompactorOptions::default())
     }
 
     pub fn new_with_redis(
@@ -35,6 +59,7 @@ impl<S: Store + Clone> Compactor<S> {
         namespace: impl Into<String>,
         opts: WriterOptions,
         redis: Option<Arc<RedisStore>>,
+        compactor_opts: CompactorOptions,
     ) -> Self {
         let namespace = namespace.into();
         Self {
@@ -45,11 +70,42 @@ impl<S: Store + Clone> Compactor<S> {
             tombstone_manager: TombstoneManager::new(storage, &namespace),
             redis,
             last_run: Arc::new(RwLock::new(None)),
+            use_distributed_lock: compactor_opts.use_distributed_lock,
+            lock_ttl_secs: compactor_opts.lock_ttl_secs,
+            use_pubsub_invalidation: compactor_opts.use_pubsub_invalidation,
         }
     }
 
     pub async fn run(&self) -> Result<(), String> {
         info!("Starting compaction cycle...");
+
+        // Acquire distributed lock if enabled and Redis is available
+        let _lock = if self.use_distributed_lock {
+            if let Some(redis) = &self.redis {
+                let lock_name = format!("compaction:{}", self.namespace);
+                match redis.try_lock(&lock_name, self.lock_ttl_secs).await {
+                    Ok(Some(lock)) => {
+                        info!("Acquired compaction lock for namespace {}", self.namespace);
+                        Some(lock)
+                    }
+                    Ok(None) => {
+                        info!(
+                            "Compaction skipped - lock held by another instance for namespace {}",
+                            self.namespace
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Failed to acquire compaction lock: {} - proceeding without lock", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let (mut entries, wal_files) = self
             .wal_reader
@@ -59,6 +115,7 @@ impl<S: Store + Clone> Compactor<S> {
 
         if entries.is_empty() {
             info!("No WAL entries to compact");
+            // Lock will be released when _lock is dropped
             return Ok(());
         }
 
@@ -185,11 +242,38 @@ impl<S: Store + Clone> Compactor<S> {
         // Trim Redis WAL if enabled
         if let Some(redis) = &self.redis {
             self.trim_redis_wal(redis).await;
+            
+            // Invalidate query cache for this namespace
+            if let Err(e) = redis.invalidate_query_cache(&self.namespace).await {
+                warn!("Failed to invalidate query cache: {}", e);
+            }
+            
+            // Clear hot vectors (now compacted into segments)
+            if let Err(e) = redis.clear_hot_vectors(&self.namespace).await {
+                warn!("Failed to clear hot vectors: {}", e);
+            }
+            
+            // Publish invalidation event via pub/sub
+            if self.use_pubsub_invalidation {
+                let payload = serde_json::json!({
+                    "manifest_version": new_manifest.version,
+                    "generation": new_manifest.generation,
+                    "total_vectors": new_manifest.total_doc_count(),
+                    "segment_count": new_manifest.segments.len(),
+                });
+                if let Err(e) = redis
+                    .publish_invalidation(&self.namespace, "compaction_complete", &payload.to_string())
+                    .await
+                {
+                    warn!("Failed to publish invalidation event: {}", e);
+                }
+            }
         }
 
         *self.last_run.write().await = Some(Utc::now());
 
         info!("Compaction complete: {} vectors", new_manifest.total_doc_count());
+        // Lock will be automatically released when _lock is dropped
         Ok(())
     }
 

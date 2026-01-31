@@ -82,6 +82,18 @@ pub struct Config {
     pub redis_prefix: String,
     /// TTL for Redis WAL entries in seconds (default: 3600 = 1 hour).
     pub redis_wal_ttl_secs: u64,
+    /// Enable query result caching in Redis (default: true if Redis is enabled).
+    pub redis_query_cache_enabled: bool,
+    /// TTL for cached query results in seconds (default: 60).
+    pub redis_query_cache_ttl_secs: u64,
+    /// Enable distributed compaction locking (default: true if Redis is enabled).
+    pub redis_compaction_lock_enabled: bool,
+    /// TTL for compaction lock in seconds (default: 300 = 5 minutes).
+    pub redis_compaction_lock_ttl_secs: u64,
+    /// Enable pub/sub cache invalidation (default: true if Redis is enabled).
+    pub redis_pubsub_enabled: bool,
+    /// Poll interval for Redis hot buffer sync in milliseconds (default: 50).
+    pub redis_sync_interval_ms: u64,
 }
 
 impl Config {
@@ -148,6 +160,12 @@ impl Config {
             redis_url: parse_optional_string("REDIS_URL"),
             redis_prefix: env::var("REDIS_PREFIX").unwrap_or_else(|_| "tidepool".to_string()),
             redis_wal_ttl_secs: parse_usize("REDIS_WAL_TTL_SECS", 3600) as u64,
+            redis_query_cache_enabled: parse_bool("REDIS_QUERY_CACHE_ENABLED", true),
+            redis_query_cache_ttl_secs: parse_usize("REDIS_QUERY_CACHE_TTL_SECS", 60) as u64,
+            redis_compaction_lock_enabled: parse_bool("REDIS_COMPACTION_LOCK_ENABLED", true),
+            redis_compaction_lock_ttl_secs: parse_usize("REDIS_COMPACTION_LOCK_TTL_SECS", 300) as u64,
+            redis_pubsub_enabled: parse_bool("REDIS_PUBSUB_ENABLED", true),
+            redis_sync_interval_ms: parse_usize("REDIS_SYNC_INTERVAL_MS", 50) as u64,
         };
 
         cfg.validate()?;
