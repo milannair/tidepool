@@ -637,6 +637,11 @@ impl<S: Store + Clone + 'static> Engine<S> {
         versions.clear();
         let mut manifest = self.current_manifest.write().await;
         *manifest = None;
+        
+        // Also clear Redis query cache
+        if let Some(redis) = &self.redis {
+            let _ = redis.invalidate_query_cache(&self.namespace).await;
+        }
     }
 
     /// Compute a hash of the query request for caching
