@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sha2::{Sha256, Digest};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{debug, info};
 
 use tidepool_common::attributes::AttrValue;
 use tidepool_common::document::{QueryRequest, QueryResponse, VectorResult};
 use tidepool_common::manifest::{Manifest, Manager};
+use tidepool_common::redis::RedisStore;
 use tidepool_common::segment::{Reader, ReaderOptions, SegmentData};
 use tidepool_common::storage::Store;
 use tidepool_common::tombstone::Manager as TombstoneManager;
@@ -33,6 +35,12 @@ pub struct Engine<S: Store + Clone> {
     bm25_k1: f32,
     bm25_b: f32,
     rrf_k: usize,
+    /// Optional Redis store for query caching
+    redis: Option<Arc<RedisStore>>,
+    /// Enable query result caching
+    query_cache_enabled: bool,
+    /// TTL for cached query results in seconds
+    query_cache_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +51,10 @@ pub struct EngineOptions {
     pub bm25_b: f32,
     pub rrf_k: usize,
     pub tokenizer_config: tidepool_common::text::TokenizerConfig,
+    /// Enable query result caching (requires Redis)
+    pub query_cache_enabled: bool,
+    /// TTL for cached query results in seconds
+    pub query_cache_ttl_secs: u64,
 }
 
 impl Default for EngineOptions {
@@ -54,6 +66,8 @@ impl Default for EngineOptions {
             bm25_b: 0.75,
             rrf_k: 60,
             tokenizer_config: tidepool_common::text::TokenizerConfig::default(),
+            query_cache_enabled: true,
+            query_cache_ttl_secs: 60,
         }
     }
 }
@@ -108,6 +122,17 @@ impl<S: Store + Clone + 'static> Engine<S> {
         opts: EngineOptions,
         hot_buffer: Option<Arc<HotBuffer>>,
     ) -> Self {
+        Self::new_with_redis(storage, namespace, cache_dir, opts, hot_buffer, None)
+    }
+
+    pub fn new_with_redis(
+        storage: S,
+        namespace: impl Into<String>,
+        cache_dir: Option<String>,
+        opts: EngineOptions,
+        hot_buffer: Option<Arc<HotBuffer>>,
+        redis: Option<Arc<RedisStore>>,
+    ) -> Self {
         let namespace = namespace.into();
         let cache_path = cache_dir.as_ref().map(PathBuf::from);
         let manifest_manager =
@@ -138,6 +163,9 @@ impl<S: Store + Clone + 'static> Engine<S> {
             bm25_k1: opts.bm25_k1,
             bm25_b: opts.bm25_b,
             rrf_k: opts.rrf_k.max(1),
+            redis,
+            query_cache_enabled: opts.query_cache_enabled,
+            query_cache_ttl_secs: opts.query_cache_ttl_secs,
         }
     }
 
@@ -275,6 +303,12 @@ impl<S: Store + Clone + 'static> Engine<S> {
     }
 
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse, String> {
+        // Check cache first (only for non-include_vectors requests)
+        if !req.include_vectors {
+            if let Some(cached) = self.get_cached_result(req).await {
+                return Ok(cached);
+            }
+        }
 
         let top_k = if req.top_k == 0 { 10 } else { req.top_k };
         let metric = DistanceMetric::parse(req.distance_metric.as_deref());
@@ -526,13 +560,20 @@ impl<S: Store + Clone + 'static> Engine<S> {
         let available_segments = segments.len();
         let warming = available_segments < total_segments;
 
-        Ok(QueryResponse {
+        let response = QueryResponse {
             results,
             namespace: self.namespace.clone(),
             warming,
             available_segments,
             total_segments,
-        })
+        };
+
+        // Cache the result (only for non-include_vectors requests)
+        if !include_vectors {
+            self.cache_result(req, &response).await;
+        }
+
+        Ok(response)
     }
 
     pub async fn get_manifest(&self) -> Option<Manifest> {
@@ -596,6 +637,88 @@ impl<S: Store + Clone + 'static> Engine<S> {
         versions.clear();
         let mut manifest = self.current_manifest.write().await;
         *manifest = None;
+    }
+
+    /// Compute a hash of the query request for caching
+    fn compute_query_hash(req: &QueryRequest) -> String {
+        let mut hasher = Sha256::new();
+        
+        // Hash vector (convert floats to bytes)
+        for v in &req.vector {
+            hasher.update(v.to_le_bytes());
+        }
+        
+        // Hash text
+        if let Some(text) = &req.text {
+            hasher.update(text.as_bytes());
+        }
+        
+        // Hash mode
+        if let Some(mode) = &req.mode {
+            hasher.update(mode.as_bytes());
+        }
+        
+        // Hash top_k
+        hasher.update(req.top_k.to_le_bytes());
+        
+        // Hash filters
+        if let Some(filters) = &req.filters {
+            let json = serde_json::to_string(filters).unwrap_or_default();
+            hasher.update(json.as_bytes());
+        }
+        
+        // Hash other params
+        hasher.update(req.ef_search.to_le_bytes());
+        hasher.update(req.nprobe.to_le_bytes());
+        
+        if let Some(metric) = &req.distance_metric {
+            hasher.update(metric.as_bytes());
+        }
+        
+        let result = hasher.finalize();
+        hex::encode(&result[..16]) // Use first 16 bytes for shorter hash
+    }
+
+    /// Try to get a cached query result
+    async fn get_cached_result(&self, req: &QueryRequest) -> Option<QueryResponse> {
+        if !self.query_cache_enabled {
+            return None;
+        }
+        
+        let redis = self.redis.as_ref()?;
+        let query_hash = Self::compute_query_hash(req);
+        
+        match redis.get_cached_query(&self.namespace, &query_hash).await {
+            Ok(Some(cached)) => {
+                match serde_json::from_str(&cached.results_json) {
+                    Ok(response) => {
+                        debug!("Query cache hit for hash {}", query_hash);
+                        Some(response)
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Cache a query result
+    async fn cache_result(&self, req: &QueryRequest, response: &QueryResponse) {
+        if !self.query_cache_enabled {
+            return;
+        }
+        
+        let Some(redis) = &self.redis else { return };
+        let query_hash = Self::compute_query_hash(req);
+        
+        if let Ok(json) = serde_json::to_string(response) {
+            if let Err(e) = redis
+                .cache_query(&self.namespace, &query_hash, &json, self.query_cache_ttl_secs)
+                .await
+            {
+                debug!("Failed to cache query result: {}", e);
+            }
+        }
     }
 }
 

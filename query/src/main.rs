@@ -142,7 +142,7 @@ async fn main() {
         info!("Hot buffer disabled (HOT_BUFFER_MAX_SIZE=0)");
     }
 
-    let namespaces = NamespaceManager::new(
+    let namespaces = NamespaceManager::new_with_redis(
         local_store,
         Some(cfg.data_dir.clone()),
         EngineOptions {
@@ -152,12 +152,16 @@ async fn main() {
             bm25_b: cfg.bm25_b,
             rrf_k: cfg.rrf_k,
             tokenizer_config: cfg.tokenizer_config(),
+            query_cache_enabled: cfg.redis_query_cache_enabled && cfg.redis_url.is_some(),
+            query_cache_ttl_secs: cfg.redis_query_cache_ttl_secs,
         },
         cfg.hot_buffer_max_size,
         cfg.allowed_namespaces.clone(),
         cfg.max_namespaces,
         cfg.namespace_idle_timeout,
         cfg.namespace.clone(),
+        redis.clone(),
+        cfg.redis_pubsub_enabled && cfg.redis_url.is_some(),
     );
     let namespaces = Arc::new(namespaces);
 

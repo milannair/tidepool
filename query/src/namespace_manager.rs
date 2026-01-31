@@ -3,15 +3,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use tidepool_common::document::NamespaceInfo;
 use tidepool_common::manifest::Manager as ManifestManager;
+use tidepool_common::redis::RedisStore;
 use tidepool_common::storage::{Store, StorageError};
 use tidepool_common::wal::Reader as WalReader;
 
 use crate::buffer::HotBuffer;
 use crate::engine::{Engine, EngineOptions};
+use crate::invalidation::spawn_invalidation_listener;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NamespaceError {
@@ -21,12 +24,14 @@ pub enum NamespaceError {
     Storage(#[from] StorageError),
 }
 
-struct NamespaceEntry<S: Store + Clone> {
+struct NamespaceEntry<S: Store + Clone + Send + Sync + 'static> {
     engine: Arc<Engine<S>>,
     last_access: Instant,
+    /// Background task for invalidation listener
+    invalidation_task: Option<JoinHandle<()>>,
 }
 
-pub struct NamespaceManager<S: Store + Clone> {
+pub struct NamespaceManager<S: Store + Clone + Send + Sync + 'static> {
     storage: S,
     cache_dir: Option<String>,
     options: EngineOptions,
@@ -35,10 +40,14 @@ pub struct NamespaceManager<S: Store + Clone> {
     idle_timeout: Option<Duration>,
     allowed_namespaces: Option<HashSet<String>>,
     fixed_namespace: Option<String>,
+    /// Optional Redis store for caching and pub/sub
+    redis: Option<Arc<RedisStore>>,
+    /// Enable pub/sub invalidation
+    pubsub_enabled: bool,
     namespaces: RwLock<HashMap<String, NamespaceEntry<S>>>,
 }
 
-impl<S: Store + Clone + 'static> NamespaceManager<S> {
+impl<S: Store + Clone + Send + Sync + 'static> NamespaceManager<S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: S,
@@ -49,6 +58,33 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
         max_namespaces: Option<usize>,
         idle_timeout: Option<Duration>,
         fixed_namespace: Option<String>,
+    ) -> Self {
+        Self::new_with_redis(
+            storage,
+            cache_dir,
+            options,
+            hot_buffer_max_size,
+            allowed_namespaces,
+            max_namespaces,
+            idle_timeout,
+            fixed_namespace,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_redis(
+        storage: S,
+        cache_dir: Option<String>,
+        options: EngineOptions,
+        hot_buffer_max_size: usize,
+        allowed_namespaces: Option<Vec<String>>,
+        max_namespaces: Option<usize>,
+        idle_timeout: Option<Duration>,
+        fixed_namespace: Option<String>,
+        redis: Option<Arc<RedisStore>>,
+        pubsub_enabled: bool,
     ) -> Self {
         let allowed_namespaces = match fixed_namespace.as_ref() {
             Some(ns) => Some([ns.clone()].into_iter().collect()),
@@ -64,6 +100,8 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
             idle_timeout,
             allowed_namespaces,
             fixed_namespace,
+            redis,
+            pubsub_enabled,
             namespaces: RwLock::new(HashMap::new()),
         }
     }
@@ -125,19 +163,37 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
                 None
             };
 
-            let engine = Engine::new_with_buffer(
+            let engine = Engine::new_with_redis(
                 self.storage.clone(),
                 namespace.to_string(),
                 self.cache_dir.clone(),
                 self.options.clone(),
                 hot_buffer,
+                self.redis.clone(),
             );
             let engine = Arc::new(engine);
+
+            // Spawn invalidation listener if Redis and pub/sub are enabled
+            let invalidation_task = if self.pubsub_enabled {
+                if let Some(redis) = &self.redis {
+                    Some(spawn_invalidation_listener(
+                        redis.clone(),
+                        engine.clone(),
+                        namespace.to_string(),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             guard.insert(
                 namespace.to_string(),
                 NamespaceEntry {
                     engine: engine.clone(),
                     last_access: Instant::now(),
+                    invalidation_task,
                 },
             );
             engine
@@ -245,14 +301,20 @@ impl<S: Store + Clone + 'static> NamespaceManager<S> {
     }
 }
 
-fn evict_lru<S: Store + Clone>(
+fn evict_lru<S: Store + Clone + Send + Sync + 'static>(
     guard: &mut HashMap<String, NamespaceEntry<S>>,
 ) -> Option<Arc<Engine<S>>> {
     let lru_name = guard
         .iter()
         .min_by_key(|(_, entry)| entry.last_access)
         .map(|(name, _)| name.clone())?;
-    guard.remove(&lru_name).map(|entry| entry.engine)
+    guard.remove(&lru_name).map(|entry| {
+        // Abort the invalidation task when evicting
+        if let Some(task) = entry.invalidation_task {
+            task.abort();
+        }
+        entry.engine
+    })
 }
 
 fn parse_namespace_from_key(key: &str) -> Option<&str> {
